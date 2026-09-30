@@ -368,7 +368,31 @@ These are real and are not regressions:
 
 ---
 
-## GPU acceleration (optional)
+## What's new in 3.5
+
+- **Extension repair.** Recovered files are written under their true extension.
+  This crew randomises extensions before encrypting (a video named `.jpg`), so
+  unmicro reads the decrypted bytes and corrects a genuinely mismatched
+  extension, reporting each one. On by default; `--no-fix-ext` turns it off.
+- **`--scavenge FILE`.** Pulls candidate keys out of an unencrypted dump (memory
+  image, pagefile, hibernation file, strings listing) and tries them first,
+  where a typed key most often survives in the clear.
+- **`--dumb-brute`.** A plain structural brute, 3 characters up to the longest
+  recovered key, over the Turkish+English alphabet these operators type
+  (`--charset`). Pauses and asks before a length that would take too long.
+- **Bounded-memory sweep.** A long `--brute`/`--dumb-brute` run now holds flat
+  memory instead of growing without bound (`--seen-cap`), which fixes an
+  out-of-memory kill on deep runs.
+- **`--checkpoint FILE`.** Save sweep progress and resume, skipping finished
+  tiers and fast-forwarding the current one.
+- **Full-auto.** A bare `python3 unmicro.py` searches every drive, tries every
+  route, and writes to `./unmicro-recovered`.
+- **All cores by default.** `--workers` now defaults to every CPU core; set 1 to
+  stay single-process.
+- **`--gpu` (experimental).** OpenCL sweep for NVIDIA and AMD, self-tested
+  against the CPU. See below.
+
+## GPU acceleration (optional, experimental)
 
 The sweep is one AES-256 decrypt per candidate, which is exactly what a GPU is
 good at. `--gpu` runs the guessing on an OpenCL device, which covers both NVIDIA
@@ -388,6 +412,12 @@ GPU and the run continues on the CPU. Every GPU hit is re-decrypted and
 re-validated on the CPU before it counts. So the GPU can make the search faster,
 or on hardware where the kernel does not hold up simply not engage. It cannot
 make the search wrong or cause a key to be missed.
+
+This path is **new and experimental in 3.5**. The kernel's AES-256 logic was
+verified against a reference AES on random vectors, but the OpenCL execution
+itself should be confirmed on your own card: run `--gpu` and look for the line
+`GPU ready: <device> (AES self-test passed against the CPU back end)`. If you
+see a self-test failure instead, it has already fallen back to the CPU.
 
 ## Options worth knowing
 

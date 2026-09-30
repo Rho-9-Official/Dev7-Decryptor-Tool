@@ -68,13 +68,15 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # pycryptodome only. unmicro tries the "cryptography" library first and
-      # pycryptodome second, so installing just this one makes the bundled
-      # backend deterministic and keeps the binary smaller.
+      # pycryptodome for the AES backend (unmicro tries "cryptography" first and
+      # pycryptodome second, so installing just this one keeps the bundled
+      # backend deterministic and the binary smaller), and filetype for the
+      # extension-repair detector. filetype is pure Python with no sub-deps, so
+      # it adds almost nothing to the binary.
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller pycryptodome
+          python -m pip install pyinstaller pycryptodome filetype
 
       - name: Read version from unmicro.py
         id: ver
@@ -103,6 +105,7 @@ jobs:
           --noupx
           --name unmicro
           --hidden-import Crypto.Cipher.AES
+          --collect-submodules filetype
           unmicro.py
 
       - name: Smoke test the binary
@@ -125,6 +128,14 @@ jobs:
           banner=$("$BIN" --in smoke/empty --identify 2>&1 || true)
           echo "$banner"
           echo "$banner" | grep -Eq "AES back end: (pycryptodome|cryptography)"
+
+          echo "--- the filetype detector is bundled for extension repair ---"
+          # A missing filetype would silently fall back to the built-in table.
+          # The banner names the active detector on any non --identify run, so
+          # this fails the build if filetype did not make it into the binary.
+          det=$("$BIN" --in smoke/empty --out smoke/out 2>&1 || true)
+          echo "$det"
+          echo "$det" | grep -Eq "Type detection: filetype "
 
           echo "smoke test passed"
 

@@ -157,7 +157,7 @@ except Exception:
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
 
-VERSION = "3.4"
+VERSION = "3.5"
 EXT = ".cryptedmicro"
 
 WINDOWS = os.name == "nt"
