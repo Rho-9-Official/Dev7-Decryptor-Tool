@@ -54,6 +54,10 @@ SAFETY RULES BUILT IN
 
 USAGE
 
+    Just run it (search everything, try every route, write to a folder it
+    makes):
+        python3 unmicro.py
+
     Find everything and try the known keys:
         python3 unmicro.py --auto --out ./recovered
 
@@ -69,6 +73,17 @@ USAGE
     Guess harder, takes much longer:
         python3 unmicro.py --in ./encrypted --out ./recovered --brute --deep --workers 4
 
+    Plain structural brute force, 3 chars up over a Turkish+English alphabet,
+    resumable:
+        python3 unmicro.py --in ./encrypted --out ./recovered --dumb-brute --checkpoint run.ckpt
+
+    Try strings out of a memory image, pagefile or strings dump first, which is
+    often where a typed key survives:
+        python3 unmicro.py --in ./encrypted --out ./recovered --scavenge memory.dmp
+
+    Run the sweep on an OpenCL GPU (NVIDIA or AMD), self-tested against the CPU:
+        python3 unmicro.py --in ./encrypted --out ./recovered --brute --gpu
+
     Work out which key applies and write nothing:
         python3 unmicro.py --auto --identify --brute
 
@@ -77,9 +92,28 @@ NOTES
     * Runs on plain Python 3.7+ with nothing installed. If pycryptodome or
       cryptography is present it is used and is far faster, which matters a
       great deal for --brute. Termux friendly.
+    * Recovered files are written under their true extension. This crew has
+      started randomising extensions before encrypting, so a recovered video
+      can arrive named .jpg and an archive named .png. After a file decrypts,
+      its real type is read from the recovered bytes, and if the name's
+      extension genuinely contradicts the content the output is written under
+      the corrected extension and the swap is reported. This is a naming repair
+      on the recovered copy only: the recovered bytes are never altered and the
+      encrypted originals are never touched. Detection uses the filetype
+      library (pip install filetype); without it a smaller built in table is
+      used instead. It is on by default; --no-fix-ext turns it off.
     * Key detection works because the first bytes of most file formats are
       fixed. For formats this tool does not recognise, supply the key with
       --key and pass --force.
+    * When the recovered keys miss, there are three further routes, cheapest
+      first. --scavenge FILE tries strings pulled from an unencrypted dump (a
+      memory image, pagefile or strings listing), where a typed key often
+      survives in the clear. --brute sweeps candidates modelled on this crew's
+      key history. --dumb-brute is a plain structural brute, 3 characters up to
+      the longest recovered key, over the Turkish and English alphabet these
+      operators type on; it pauses and asks before a length that would take too
+      long. A long sweep holds flat, bounded memory (see --seen-cap) and can be
+      made resumable with --checkpoint FILE.
     * If nothing is found, that is not the end, but do not assume the machine's
       own recovery paths survived. This crew disables Windows Recovery, Task
       Manager and Regedit, and adds a Defender exclusion. Check what is
@@ -102,10 +136,57 @@ import string
 import sys
 import time
 
-VERSION = "3.2"
+# Content based type detection for extension repair (Section 8b). filetype is
+# the intended engine and carries the broad, current signature set. It is pure
+# Python with no sub dependencies, so it bundles into the frozen binary and
+# installs on Termux with a single pip. If it is genuinely absent the tool
+# still decrypts: extension repair falls back to the built in SIGNATURES table
+# and says so once. Nothing on the decryption path depends on it.
+try:
+    import filetype as _filetype
+    HAVE_FILETYPE = True
+    try:
+        FILETYPE_VERSION = _filetype.version.__version__
+    except Exception:
+        try:
+            FILETYPE_VERSION = _filetype.__version__
+        except Exception:
+            FILETYPE_VERSION = "?"
+except Exception:
+    _filetype = None
+    HAVE_FILETYPE = False
+    FILETYPE_VERSION = None
+
+VERSION = "3.4"
 EXT = ".cryptedmicro"
 
 WINDOWS = os.name == "nt"
+
+# Hard cap on how many entries each generator's duplicate-suppression set may
+# hold. The dedup stays exact, but when a set reaches this many entries it is
+# cleared and refilled rather than growing without bound, which is what keeps
+# memory flat over a long --brute or --dumb-brute run. The only cost of a clear
+# is that a few already-seen candidates may be regenerated and retested, which
+# is cheap and, unlike a probabilistic filter, never skips a candidate. A
+# skipped candidate in a decryptor can be the victim's key. Override with
+# --seen-cap. The default keeps the concurrently live sets inside a few hundred
+# MB, so a deep sweep runs on a modest machine instead of being OOM-killed.
+SEEN_CAP = 1_000_000
+
+# Where a bare, no-options run drops what it recovers. Created if missing.
+DEFAULT_OUT_DIR = "unmicro-recovered"
+
+# Alphabets for the structural brute (--dumb-brute). These operators type on a
+# Turkish Q layout, and a character that a language does not have is a character
+# the key cannot contain, so widening the alphabet to Turkish AND English, but
+# no further, is real coverage rather than wasted space. Turkish has no q, w or x
+# but adds ç ğ ı ö ş ü (and the dotted/dotless i pair); English supplies q, w, x,
+# which do show up in the operators' keyboard-mash keys. Digits are always in.
+ENGLISH_LOWER = "abcdefghijklmnopqrstuvwxyz"
+ENGLISH_UPPER = ENGLISH_LOWER.upper()
+TURKISH_LOWER = "çğıöşü"      # ç ğ ı ö ş ü
+TURKISH_UPPER = "ÇĞİÖŞÜ"      # Ç Ğ İ Ö Ş Ü
+DIGITS = "0123456789"
 
 
 # ===========================================================================
@@ -857,6 +938,50 @@ def collect(root, recursive):
 
 
 # ===========================================================================
+# SECTION 5b. Bounded duplicate suppression.
+#
+# The candidate generators dedupe with a set so a candidate reachable by several
+# paths is only tested once. On a long sweep that set grew without bound and was
+# the cause of an out-of-memory kill deep into --brute. BoundedSeen caps it: the
+# membership stays exact, but at the cap it clears and refills. A cleared entry
+# can be regenerated and retested, a few microseconds of AES, and nothing is
+# ever skipped. That last point is why this is a capped exact set and not a
+# Bloom filter: a Bloom false positive would drop a candidate untested, and the
+# one candidate you cannot afford to drop is the operator's actual key.
+# ===========================================================================
+
+class BoundedSeen(object):
+    """Exact-membership set with a hard entry cap. Supports the two operations
+    the generators use, ``x in s`` and ``s.add(x)``, so it is a drop-in for the
+    plain set they used before."""
+
+    __slots__ = ("_s", "_cap", "clears")
+
+    def __init__(self, cap=None):
+        self._s = set()
+        self._cap = int(cap) if cap else SEEN_CAP
+        self.clears = 0
+
+    def __contains__(self, x):
+        return x in self._s
+
+    def __iter__(self):
+        # Snapshot: callers that iterate (gen_known_variants) then add while
+        # iterating, so hand them a stable copy rather than the live set.
+        return iter(list(self._s))
+
+    def __len__(self):
+        return len(self._s)
+
+    def add(self, x):
+        s = self._s
+        if x not in s and len(s) >= self._cap:
+            s.clear()
+            self.clears += 1
+        s.add(x)
+
+
+# ===========================================================================
 # SECTION 6a. Mutation helpers.
 #
 # Every confirmed key falls into one of six shapes. The generators below are
@@ -1038,7 +1163,7 @@ class KeyModel(object):
     def gen_known_variants(self):
         """Case, Turkish folding, adjacent transposition and short affixes of
         every confirmed key. zarox to zarxo is a confirmed real mutation."""
-        seen = set()
+        seen = BoundedSeen()
         base = []
         for k in self.keys:
             base.extend(_case_variants(k))
@@ -1062,7 +1187,7 @@ class KeyModel(object):
 
         Tail widths are walked in ascending cost, not descending probability:
         a width costs len(stems) * len(digits) ** width."""
-        seen = set()
+        seen = BoundedSeen()
         for st in self.stem_pool:
             if st not in seen:
                 seen.add(st)
@@ -1095,7 +1220,7 @@ class KeyModel(object):
     def gen_digit(self):
         """Digit keys. Motif tilings and rotations first, then a weighted
         odometer over the observed digit alphabet."""
-        seen = set()
+        seen = BoundedSeen()
 
         def emit(s):
             if s and s not in seen:
@@ -1150,7 +1275,7 @@ class KeyModel(object):
     def gen_motor(self):
         """Keyboard runs, reversals, doubles and column zigzags on the Turkish
         Q layout, then mashes over the fitted mash alphabet."""
-        seen = set()
+        seen = BoundedSeen()
 
         def emit(s):
             if s and s not in seen:
@@ -1194,7 +1319,7 @@ class KeyModel(object):
     def gen_word(self):
         """Word plus affix. anansinmi and its Turkish spelling are the
         confirmed members of this family."""
-        seen = set()
+        seen = BoundedSeen()
         for w in self.words:
             for v in _case_variants(w) + [_fold(w), _unfold(_fold(w))]:
                 if v and v not in seen:
@@ -1208,6 +1333,64 @@ class KeyModel(object):
                         if cand not in seen:
                             seen.add(cand)
                             yield cand
+
+    def dumb_alphabet(self, charset="turkish"):
+        """The character set the structural brute enumerates, ordered so the
+        characters these operators actually use come first (the odometer then
+        reaches likely strings sooner). It always starts with the distinct
+        characters seen in the recovered keys, most frequent first, then widens
+        by charset:
+
+            observed  just those characters (narrowest, fastest)
+            turkish   + Turkish and English lowercase letters and digits
+                      (default: a character a language lacks is one the key
+                      cannot hold, so Turkish+English is coverage, not waste)
+            full      + uppercase as well, Turkish and English
+
+        Following the structure of the known keys, not a dictionary.
+        """
+        counts = collections.Counter()
+        for k in self.keys:
+            counts.update(k)
+        ordered = [c for c, _ in counts.most_common()]
+
+        def extend(seq):
+            for c in seq:
+                if c not in ordered:
+                    ordered.append(c)
+
+        if charset == "observed":
+            pass
+        elif charset == "full":
+            extend(ENGLISH_LOWER + TURKISH_LOWER + DIGITS
+                   + ENGLISH_UPPER + TURKISH_UPPER)
+        else:                                       # "turkish", the default
+            extend(ENGLISH_LOWER + TURKISH_LOWER + DIGITS)
+        return ordered or list(ENGLISH_LOWER + DIGITS)
+
+    def dumb_max_len(self):
+        """The longest recovered key. The structural brute climbs to here."""
+        return max((len(k) for k in self.keys), default=8)
+
+    def gen_dumb_len(self, length, alphabet=None, charset="turkish"):
+        """Every string of exactly `length` characters over the alphabet,
+        odometer order, likeliest characters first. Produced once each, so this
+        holds no dedup state."""
+        alpha = alphabet if alphabet is not None else self.dumb_alphabet(charset)
+        for combo in itertools.product(alpha, repeat=length):
+            yield "".join(combo)
+
+    def gen_dumb(self, min_len=3, max_len=None, charset="turkish"):
+        """Classic incremental brute force, the dumb counterpart to the fitted
+        model: every string from min_len characters up to the longest recovered
+        key, over the Turkish+English alphabet, shortest first. No wordlist, no
+        motifs. It reaches a key the vocabulary cannot, at brute-force cost, so
+        only the short lengths finish in any realistic budget."""
+        alpha = self.dumb_alphabet(charset)
+        hi = max_len or self.dumb_max_len()
+        for length in range(min_len, hi + 1):
+            for cand in self.gen_dumb_len(length, alphabet=alpha):
+                yield cand
 
     # ---------------------------------------------------------- scheduling
     def interleaved(self, deep=False):
@@ -1224,7 +1407,7 @@ class KeyModel(object):
         for name, gen in fams:
             share = max(1, int(round(self.family_mass.get(name, 0.235) * 40)))
             quota.append([name, gen, share * (4 if deep else 1)])
-        seen = set()
+        seen = BoundedSeen()
         live = True
         while live:
             live = False
@@ -1254,11 +1437,59 @@ def get_model():
     return MODEL
 
 
-def build_plan(brute=False, deep=False, extra=None, wordlist=None):
+def iter_scavenged(paths, min_len=4, max_len=48):
+    """
+    Yield candidate keys pulled out of UNENCRYPTED dumps: a memory image, the
+    pagefile or hibernation file, a `strings` listing, an implant log. The key
+    is a string a person typed, so it routinely survives in the clear in one of
+    those long after the files themselves were encrypted, and trying what is
+    already sitting there beats generating candidates whenever it lands.
+
+    Extracts printable ASCII and printable UTF-16LE runs (Windows holds typed
+    strings, registry values and much of memory as UTF-16LE), splits them on
+    whitespace, deduplicates and yields each token once. Length is bounded
+    because the key is truncated to 32 bytes anyway. This reads whatever file it
+    is given as raw bytes; point it at a capture, never at an encrypted file.
+    For a very large image, run the system `strings` tool first and feed the
+    text output here.
+    """
+    seen = BoundedSeen()
+    ascii_run = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
+    utf16_run = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % min_len)
+
+    def emit(text):
+        for tok in re.split(r"\s+", text):
+            if min_len <= len(tok) <= max_len and tok not in seen:
+                seen.add(tok)
+                yield tok
+
+    for path in paths:
+        try:
+            with open(long_path(path), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        for m in ascii_run.finditer(data):
+            yield from emit(m.group().decode("ascii", "ignore"))
+        for m in utf16_run.finditer(data):
+            try:
+                yield from emit(m.group().decode("utf-16le"))
+            except Exception:
+                continue
+
+
+def build_plan(brute=False, deep=False, dumb=False, extra=None, wordlist=None,
+               scavenged=None, dumb_min_len=3, dumb_max_len=None,
+               dumb_charset="turkish"):
     """
     Ordered list of (tier name, generator factory), consumed by sweep().
-    Without --brute only supplied keys, the wordlist and the recovered keys
-    are tried. With --brute the fitted model runs as one interleaved stream.
+
+    Cheapest and highest-value tiers first: any keys you supplied, your
+    wordlist, the 34 recovered keys, then strings scavenged from a dump if you
+    gave one. --brute adds the recovered-key variants and the fitted model.
+    --dumb-brute adds one exhaustive tier PER LENGTH, from dumb_min_len up to
+    the longest recovered key, so the caller can pause between lengths before
+    one of them becomes intractable.
     """
     plan = []
     if extra:
@@ -1267,10 +1498,18 @@ def build_plan(brute=False, deep=False, extra=None, wordlist=None):
         plan.append(("wordlist", lambda: iter(list(wordlist))))
     m = get_model()
     plan.append(("recovered operator keys", m.gen_known))
-    if not brute:
-        return plan
-    plan.append(("recovered key variants", m.gen_known_variants))
-    plan.append(("fitted model", lambda: KeyModel().interleaved(deep=deep)))
+    if scavenged:
+        plan.append(("scavenged strings", lambda: iter_scavenged(scavenged)))
+    if brute:
+        plan.append(("recovered key variants", m.gen_known_variants))
+        plan.append(("fitted model", lambda: KeyModel().interleaved(deep=deep)))
+    if dumb:
+        hi = dumb_max_len or m.dumb_max_len()
+        alpha = m.dumb_alphabet(dumb_charset)
+        for length in range(dumb_min_len, hi + 1):
+            plan.append(("structural brute len=%d" % length,
+                         lambda L=length, A=alpha:
+                             get_model().gen_dumb_len(L, alphabet=A)))
     return plan
 
 
@@ -1336,22 +1575,105 @@ def _worker_chunk(chunk):
     return hits
 
 
-def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
+# --- checkpointing, so a long sweep survives an interrupt or a --max-candidates
+# stop and resumes instead of starting over. The saved state is tiny: which tier,
+# how many of its candidates were consumed, and how many were tried in total. A
+# signature ties the file to one problem (these probe blocks, this tier list), so
+# a checkpoint written for a different set of files is ignored, never misapplied.
+
+def _ckpt_sig(probes):
+    # Tie the checkpoint to the files (their probe blocks), not to the exact
+    # tier list, so a resume with slightly different flags still matches. The
+    # tier in progress is recorded by name and looked up in the current plan.
+    import hashlib
+    h = hashlib.blake2b(digest_size=8)
+    for blk, _ in probes:
+        h.update(blk)
+    return h.hexdigest()
+
+
+def _ckpt_load(path, sig):
+    if not path:
+        return None, 0, 0
+    try:
+        import json
+        with open(long_path(path), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("sig") == sig:
+            return d.get("tier"), int(d["consumed"]), int(d["tried"])
+    except Exception:
+        pass
+    return None, 0, 0
+
+
+def _ckpt_save(path, sig, tier_name, consumed, tried):
+    if not path:
+        return
+    try:
+        import json
+        tmp = path + ".part"
+        with open(long_path(tmp), "w", encoding="utf-8") as fh:
+            json.dump({"sig": sig, "tier": tier_name, "consumed": consumed,
+                       "tried": tried}, fh)
+        os.replace(long_path(tmp), long_path(path))
+    except Exception:
+        pass
+
+
+def _ckpt_clear(path):
+    if not path:
+        return
+    try:
+        os.remove(long_path(path))
+    except OSError:
+        pass
+
+
+def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000,
+          checkpoint=None, on_tier_start=None, gpu=None):
     """
     Run the tiers in order against the probe blocks. Stops at the first tier
     that produces a hit, since in this family one key normally covers a whole
     machine. Returns (hit key strings, candidates tried).
+
+    checkpoint (a path) makes the sweep resumable: progress is saved each chunk,
+    and if the file already holds progress for this same set of files, completed
+    tiers are skipped and the current tier is fast-forwarded past what was
+    already tried. Fast-forwarding only regenerates candidate strings, it never
+    re-tests them, so a resume is far cheaper than the run it continues.
+
+    on_tier_start(name, tier_index) -> bool, if given, is called before each
+    tier. Returning False stops the sweep there (used to pause and ask before a
+    structural-brute length that would take too long).
     """
     probes = probe_set(files)
     if not probes:
         return [], 0
 
+    sig = _ckpt_sig(probes)
+    saved_name, start_consumed, tried = _ckpt_load(checkpoint, sig)
+    names = [n for n, _ in plan]
+    start_tier = 0
+    if saved_name is not None and saved_name in names:
+        start_tier = names.index(saved_name)
+    elif saved_name is not None:
+        # the tier in the checkpoint is not in this plan (different flags): the
+        # earlier tiers are cheap, so just start over rather than misapply it.
+        start_consumed, tried = 0, 0
+    if not quiet and (start_tier or start_consumed or tried):
+        print("  resuming from checkpoint: '%s', %d candidate(s) already tried"
+              % (names[start_tier] if start_tier < len(names) else saved_name, tried))
+
     _worker_init(probes)
-    tried = 0
     t0 = time.time()
 
+    # On the GPU the batch itself is the parallelism, so process the sweep in
+    # much larger chunks and skip the CPU worker pool.
+    if gpu is not None and chunk_size < (1 << 18):
+        chunk_size = 1 << 20
+
     pool = None
-    if workers > 1:
+    if gpu is None and workers > 1:
         try:
             import multiprocessing
             pool = multiprocessing.Pool(workers, initializer=_worker_init,
@@ -1360,8 +1682,23 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
             pool = None
 
     try:
-        for name, factory in plan:
+        for tier_idx, (name, factory) in enumerate(plan):
+            if tier_idx < start_tier:
+                continue                          # finished in a prior run
+            if on_tier_start is not None and not on_tier_start(name, tier_idx):
+                # A gate declined this tier. Record it by name so a later
+                # resume comes back to exactly here, and stop.
+                _ckpt_save(checkpoint, sig, name, 0, tried)
+                return [], tried
             gen = factory()
+            consumed = 0
+            if tier_idx == start_tier and start_consumed:
+                if not quiet:
+                    sys.stderr.write("  fast-forwarding %d candidate(s)...\r"
+                                     % start_consumed)
+                    sys.stderr.flush()
+                collections.deque(itertools.islice(gen, start_consumed), maxlen=0)
+                consumed = start_consumed
             tier_start = tried
             confirmed = []
             rejected = 0
@@ -1369,7 +1706,9 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
                 chunk = list(itertools.islice(gen, chunk_size))
                 if not chunk:
                     break
-                if pool:
+                if gpu is not None:
+                    raw = gpu.filter_chunk(chunk, probes)
+                elif pool:
                     slices = [chunk[i::workers] for i in range(workers)]
                     raw = []
                     for hits in pool.imap_unordered(_worker_chunk, slices):
@@ -1377,6 +1716,7 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
                 else:
                     raw = _worker_chunk(chunk)
                 tried += len(chunk)
+                consumed += len(chunk)
 
                 # A header match is evidence, nothing more. Proof is the whole
                 # file validating structurally. Anything that fails this gate
@@ -1390,6 +1730,8 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
                     else:
                         rejected += 1
 
+                _ckpt_save(checkpoint, sig, name, consumed, tried)
+
                 if not quiet:
                     rate = tried / max(time.time() - t0, 0.001)
                     sys.stderr.write("  %-26s %11d tried  %9.0f/s\r"
@@ -1400,6 +1742,7 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
                 if limit and tried >= limit:
                     if not quiet:
                         sys.stderr.write(" " * 72 + "\r")
+                    # keep the checkpoint: the budget stopped us, not completion
                     return [], tried
             if not quiet:
                 sys.stderr.write(" " * 72 + "\r")
@@ -1407,14 +1750,20 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000):
                 note = "HIT" if confirmed else "no hit"
                 if rejected:
                     note += "  (%d coincidental header match(es) discarded)" % rejected
-                print("  tier %-26s %11d candidates  %s"
+                print("  tier %-30s %13d candidates  %s"
                       % (name, tried - tier_start, note))
             if confirmed:
+                _ckpt_clear(checkpoint)
                 return confirmed, tried
+            # tier finished, no hit: record the next tier by name so a resume
+            # skips this one
+            nxt = plan[tier_idx + 1][0] if tier_idx + 1 < len(plan) else name
+            _ckpt_save(checkpoint, sig, nxt, 0, tried)
     finally:
         if pool:
             pool.terminate()
             pool.join()
+    _ckpt_clear(checkpoint)
     return [], tried
 
 
@@ -1466,7 +1815,7 @@ def map_keys_to_files(files, keys):
 
 
 def find_all_keys(files, plan, workers=1, limit=None, quiet=False,
-                  max_passes=8):
+                  max_passes=8, checkpoint=None, on_tier_start=None, gpu=None):
     """
     Sweep until every file is accounted for, or until a round turns up
     nothing new. Returns (mapping, candidates tried, files still unmatched).
@@ -1505,7 +1854,8 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False,
                   % len(remaining))
 
         found, tried = sweep(remaining, plan, workers=workers, limit=budget,
-                             quiet=quiet)
+                             quiet=quiet, checkpoint=checkpoint,
+                             on_tier_start=on_tier_start, gpu=gpu)
         tried_total += tried
 
         fresh = [k for k in found if k not in mapping]
@@ -1528,6 +1878,221 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False,
         remaining = [f for f in remaining if f not in covered]
 
     return mapping, tried_total, remaining
+
+
+# ===========================================================================
+# SECTION 7b. Optional OpenCL GPU acceleration (NVIDIA and AMD).
+#
+# The sweep spends nearly all of its time on one operation: AES-256 decrypt the
+# probe block under a candidate key and look at the result. That is embarrassing
+# parallelism, one independent decrypt per candidate, which is exactly what a GPU
+# is for. One OpenCL kernel covers both NVIDIA and AMD.
+#
+# This is opt-in (--gpu) and optional: pyopencl and a working OpenCL driver are
+# only touched when it is asked for, so the default tool still runs on bare
+# Python with nothing installed.
+#
+# CORRECTNESS, because this is a recovery tool and a wrong kernel is worse than
+# no kernel. The danger is not a false positive, every GPU hit is re-decrypted
+# and re-validated on the CPU before it counts, so a bad flag is caught. The
+# danger is a false NEGATIVE: a subtly wrong kernel would decrypt everything
+# wrong, so the real key's decryption would not match and it would be skipped in
+# silence. Two things stop that:
+#   1. Key derivation (UTF-8 encode, zero-pad to 32) is done on the CPU by the
+#      same key_bytes() the rest of the tool uses. The GPU only ever sees ready
+#      32-byte keys, so multi-byte Turkish characters cannot be mis-encoded on
+#      the device.
+#   2. Before the GPU is trusted for a single real candidate, selftest() decrypts
+#      random blocks under random keys on the GPU and compares every byte against
+#      the CPU AES back end. A single mismatch disables the GPU and the run falls
+#      back to the CPU. So the GPU can make the search faster or, on hardware
+#      where the kernel does not hold up, simply not engage. It cannot make the
+#      search wrong.
+#
+# The S-boxes are injected from the same _SBOX/_INV_SBOX this file already built
+# from the field arithmetic, so there is no second copy of them to get wrong.
+# ===========================================================================
+
+def _gpu_kernel_source():
+    # Token replacement, not %-formatting: the kernel body contains i%8 etc.
+    sbox = ",".join(str(b) for b in _SBOX)
+    isbox = ",".join(str(b) for b in _INV_SBOX)
+    return (_GPU_KERNEL_TEMPLATE
+            .replace("KERNEL_INVSBOX_DATA", isbox)
+            .replace("KERNEL_SBOX_DATA", sbox))
+
+
+_GPU_KERNEL_TEMPLATE = """
+__constant uchar SBOX[256]  = {KERNEL_SBOX_DATA};
+__constant uchar ISBOX[256] = {KERNEL_INVSBOX_DATA};
+__constant uchar RCON[8]    = {0,1,2,4,8,16,32,64};
+
+inline uchar gmul(uchar a, uchar b){
+    uchar p = 0;
+    for(int i=0;i<8;i++){
+        if(b & 1) p ^= a;
+        uchar hi = a & 0x80;
+        a <<= 1;
+        if(hi) a ^= 0x1b;
+        b >>= 1;
+    }
+    return p;
+}
+
+__kernel void aes256_ecb_decrypt(__global const uchar* keys,
+                                 __global const uchar* ct,
+                                 __global uchar* out,
+                                 const uint n){
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    __global const uchar* k = keys + (uint)gid*32;
+
+    uchar rk[240];
+    for(int i=0;i<32;i++) rk[i] = k[i];
+    int rconi = 1;
+    for(int i=8;i<60;i++){
+        uchar t0=rk[(i-1)*4+0], t1=rk[(i-1)*4+1], t2=rk[(i-1)*4+2], t3=rk[(i-1)*4+3];
+        if(i%8==0){
+            uchar tmp=t0;
+            t0 = SBOX[t1] ^ RCON[rconi]; t1 = SBOX[t2]; t2 = SBOX[t3]; t3 = SBOX[tmp];
+            rconi++;
+        } else if(i%8==4){
+            t0=SBOX[t0]; t1=SBOX[t1]; t2=SBOX[t2]; t3=SBOX[t3];
+        }
+        rk[i*4+0]=rk[(i-8)*4+0]^t0; rk[i*4+1]=rk[(i-8)*4+1]^t1;
+        rk[i*4+2]=rk[(i-8)*4+2]^t2; rk[i*4+3]=rk[(i-8)*4+3]^t3;
+    }
+
+    uchar s[16], t[16];
+    for(int i=0;i<16;i++) s[i] = ct[i] ^ rk[14*16 + i];
+    for(int round=13; round>=1; round--){
+        for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];
+        for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];
+        for(int i=0;i<16;i++) t[i] ^= rk[round*16 + i];
+        for(int c=0;c<4;c++){
+            uchar a0=t[4*c+0],a1=t[4*c+1],a2=t[4*c+2],a3=t[4*c+3];
+            s[4*c+0]=gmul(a0,14)^gmul(a1,11)^gmul(a2,13)^gmul(a3,9);
+            s[4*c+1]=gmul(a0,9)^gmul(a1,14)^gmul(a2,11)^gmul(a3,13);
+            s[4*c+2]=gmul(a0,13)^gmul(a1,9)^gmul(a2,14)^gmul(a3,11);
+            s[4*c+3]=gmul(a0,11)^gmul(a1,13)^gmul(a2,9)^gmul(a3,14);
+        }
+    }
+    for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];
+    for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];
+    for(int i=0;i<16;i++) out[(uint)gid*16 + i] = t[i] ^ rk[0*16 + i];
+}
+"""
+
+
+class GpuAES(object):
+    """OpenCL AES-256-ECB block decryption for the sweep. Decrypt only, like the
+    rest of this file. Trusted only after selftest() matches the CPU back end."""
+
+    def __init__(self):
+        import pyopencl as cl
+        import numpy as np
+        self.cl, self.np = cl, np
+        devices = []
+        for plat in cl.get_platforms():
+            try:
+                devices += plat.get_devices(device_type=cl.device_type.GPU)
+            except cl.Error:
+                pass
+        if not devices:
+            raise RuntimeError("no OpenCL GPU device found (NVIDIA or AMD "
+                               "drivers and an ICD must be installed)")
+        self.device = devices[0]
+        self.name = self.device.name.strip()
+        self.ctx = cl.Context([self.device])
+        self.queue = cl.CommandQueue(self.ctx)
+        self.prog = cl.Program(self.ctx, _gpu_kernel_source()).build()
+        # offset-0..4 magics from the signature table, for a fast numpy prefilter
+        self._magics = [(off, np.frombuffer(magic, dtype=np.uint8))
+                        for off, magic, _, _ in SIGNATURES if off + len(magic) <= 16]
+
+    def decrypt_blocks(self, keys, ct16):
+        """keys: uint8 [n,32]; ct16: 16 raw bytes. Returns uint8 [n,16]."""
+        cl, np = self.cl, self.np
+        n = keys.shape[0]
+        mf = cl.mem_flags
+        keys = np.ascontiguousarray(keys, dtype=np.uint8)
+        ctnp = np.frombuffer(ct16, dtype=np.uint8).copy()
+        kbuf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=keys)
+        cbuf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=ctnp)
+        out = np.empty((n, 16), dtype=np.uint8)
+        obuf = cl.Buffer(self.ctx, mf.WRITE_ONLY, out.nbytes)
+        self.prog.aes256_ecb_decrypt(self.queue, (n,), None,
+                                     kbuf, cbuf, obuf, np.uint32(n))
+        cl.enqueue_copy(self.queue, out, obuf)
+        self.queue.finish()
+        return out
+
+    def selftest(self, trials=1024):
+        """Decrypt random blocks under random keys on the GPU and require every
+        byte to match the CPU AES back end. Returns True only on a total match."""
+        np = self.np
+        keys = np.frombuffer(os.urandom(trials * 32), dtype=np.uint8).reshape(trials, 32)
+        block = os.urandom(16)
+        gpu = self.decrypt_blocks(keys, block)
+        for i in range(trials):
+            if bytes(gpu[i]) != _dec_blocks(bytes(keys[i]), block):
+                return False
+        return True
+
+    def filter_chunk(self, candidates, probes):
+        """Return the candidates whose decrypted probe block carries a known
+        magic, for the CPU to then confirm in full. Mirrors the CPU oracle."""
+        np = self.np
+        keys = np.frombuffer(b"".join(key_bytes(c) for c in candidates),
+                             dtype=np.uint8).reshape(len(candidates), 32)
+        flagged = np.zeros(len(candidates), dtype=bool)
+        for blk, _ in probes:
+            out = self.decrypt_blocks(keys, blk)
+            for off, magic in self._magics:
+                flagged |= np.all(out[:, off:off + len(magic)] == magic, axis=1)
+        return [candidates[i] for i in np.nonzero(flagged)[0]]
+
+
+def init_gpu(quiet=False):
+    """Try to bring up the GPU back end and prove it against the CPU. Returns a
+    ready GpuAES, or None with a printed reason, in which case the caller uses
+    the CPU. Never raises: a GPU problem must not stop a recovery."""
+    try:
+        import pyopencl  # noqa: F401
+    except Exception:
+        if not quiet:
+            print("--gpu needs pyopencl and OpenCL drivers, which are not present.")
+            print("Install with: pip install pyopencl (plus your NVIDIA or AMD")
+            print("OpenCL runtime). Falling back to the CPU.")
+            print()
+        return None
+    try:
+        gpu = GpuAES()
+    except Exception as e:
+        if not quiet:
+            print("GPU unavailable (%s). Falling back to the CPU." % e)
+            print()
+        return None
+    try:
+        ok = gpu.selftest()
+    except Exception as e:
+        if not quiet:
+            print("GPU self-test could not run on %s (%s). Falling back to the CPU."
+                  % (gpu.name, e))
+            print()
+        return None
+    if not ok:
+        if not quiet:
+            print("GPU self-test FAILED on %s: its AES output did not match the CPU,"
+                  % gpu.name)
+            print("so the GPU is disabled to avoid missing the key. Using the CPU.")
+            print("Please report this device; the CPU path is unaffected.")
+            print()
+        return None
+    if not quiet:
+        print("GPU ready: %s (AES self-test passed against the CPU back end)."
+              % gpu.name)
+    return gpu
 
 
 # ===========================================================================
@@ -1564,6 +2129,160 @@ def unique_path(path):
 
 
 # ===========================================================================
+# SECTION 8b. Content based type detection and extension repair.
+#
+# The Dev7 operators began randomising file extensions before encrypting, so a
+# recovered file's name is no longer a reliable guide to what it is: a video
+# arrives named .jpg, an archive named .png. Decryption is unaffected by this,
+# but the recovered file would otherwise be written under a misleading name and
+# would not open by double click.
+#
+# After a file decrypts, its true type is read from the recovered bytes. If the
+# name's extension genuinely contradicts the content the output is written under
+# the corrected extension and the swap is reported. This is a naming repair on
+# the recovered copy only. It never alters recovered bytes and never runs on the
+# encrypted originals.
+#
+# The policy is deliberately conservative, because a careless rename makes a
+# recovery worse: many correct names share magic bytes with something else. A
+# .docx is a ZIP. A .mov and a .m4a share the .mp4 box structure. A .wav and a
+# .webp are both RIFF. So a rename happens only when the content sits in a
+# different *category* from the extension, for example an image name over video
+# bytes. A same category disagreement (a .png named .jpg) is left alone, and so
+# is any container family where the current extension is already a valid member.
+#
+# detect_content_type uses filetype when installed, which is the intended engine
+# and carries the broad signature set. Without it the built in SIGNATURES table
+# (Section 2) is used as a narrower fallback. Either way decryption is untouched.
+# ===========================================================================
+
+# unmicro's own coarse grouping of an extension, chosen for the swap decision.
+# This is intentionally not filetype's own split: filetype files pdf, exe and
+# sqlite all under "archive", which is not a useful thing to compare against a
+# filename. Keys are lowercase, no leading dot.
+_CATEGORY_BY_EXT = {}
+
+
+def _cat(names, category):
+    for n in names.split():
+        _CATEGORY_BY_EXT[n] = category
+
+
+_cat("jpg jpeg jpe jfif jff png apng gif bmp dib webp tif tiff ico cur heic heif "
+     "avif jxr jp2 jpx j2k psd xcf svg svgz cr2 nef arw dng raf orf rw2 dds tga "
+     "pcx wmf emf", "image")
+_cat("mp4 m4v mov qt mkv webm avi wmv flv mpg mpeg mpe m2v ts m2ts mts 3gp 3g2 "
+     "ogv f4v vob rm rmvb asf divx", "video")
+_cat("mp3 m4a m4b aac flac wav wave ogg oga opus aiff aif aifc amr wma mid midi "
+     "ape ac3 dts au caf", "audio")
+_cat("zip 7z rar gz tgz bz2 tbz2 xz txz lz lz4 lzo zst zstd tar br cab arj lha "
+     "lzh cpio rpm deb ar crx", "archive")
+_cat("pdf doc docx docm dot dotx xls xlsx xlsm ppt pptx odt ods odp odg rtf epub "
+     "mobi azw3 fb2 wpd", "document")
+_cat("exe dll msi com scr sys elf so dylib apk jar msix appx wasm", "executable")
+_cat("ttf otf woff woff2 eot pfb pfm", "font")
+
+# Extensions that are the same underlying format under another name, so a name
+# using one when the content detects as the other is not a swap. Keyed by the
+# extension filetype reports.
+_ALIASES = {
+    "jpg":  {"jpg", "jpeg", "jpe", "jfif", "jff"},
+    "tif":  {"tif", "tiff"},
+    "mpg":  {"mpg", "mpeg", "mpe", "m2v"},
+    "midi": {"mid", "midi"},
+    "aiff": {"aif", "aiff", "aifc"},
+    "m4a":  {"m4a", "m4b", "aac"},
+    "3gp":  {"3gp", "3g2"},
+    "wav":  {"wav", "wave"},
+    "ogg":  {"ogg", "oga", "ogv", "opus"},
+}
+
+# A generic ZIP detection must never "correct" a real ZIP based container down
+# to .zip. filetype recognises the common Office and OpenDocument members on its
+# own, but anything it can only see as a plain zip is left as named when the
+# name is one of these.
+_ZIP_FAMILY = {
+    "zip", "docx", "docm", "dotx", "xlsx", "xlsm", "xltx", "pptx", "pptm",
+    "potx", "odt", "ods", "odp", "odg", "otp", "ots", "ott", "jar", "war",
+    "ear", "apk", "aar", "ipa", "xpi", "crx", "epub", "kmz", "msix", "appx",
+    "vsix", "whl", "nupkg", "3mf", "usdz",
+}
+
+# ftyp / ISO-BMFF and RIFF families. filetype tells the members apart, but if
+# one member is detected against another member's name, that is not a swap.
+_FTYP_FAMILY = {"mp4", "m4v", "mov", "qt", "m4a", "m4b", "3gp", "3g2", "heic",
+                "heif", "avif", "f4v"}
+_RIFF_FAMILY = {"webp", "wav", "wave", "avi", "ani"}
+
+# How much of the recovered plaintext to hand the detector. Every magic this
+# needs, including the ZIP local header a docx is recognised by, sits at the
+# very front of the file, so a head slice is enough and keeps large files cheap.
+_DETECT_HEAD = 65536
+
+
+def detect_content_type(head):
+    """
+    Best effort true type of a decrypted file from its leading bytes.
+
+    Returns (ext, category): ext is a lowercase extension with no dot, or None
+    if nothing is recognised; category is this module's coarse grouping. Uses
+    filetype when installed and the built in SIGNATURES table otherwise.
+    """
+    if not head:
+        return None, None
+    if HAVE_FILETYPE:
+        try:
+            kind = _filetype.guess(bytes(head))
+        except Exception:
+            kind = None
+        if kind is not None:
+            ext = (kind.extension or "").lower()
+            if ext:
+                return ext, _CATEGORY_BY_EXT.get(ext, "other")
+    # Fallback: the internal signature table's canonical extension.
+    _, canon, _ = identify_ex(head[:16])
+    if canon:
+        ext = canon.lstrip(".").lower()
+        return ext, _CATEGORY_BY_EXT.get(ext, "other")
+    return None, None
+
+
+def plan_extension_fix(name, head):
+    """
+    Decide whether a recovered file's extension contradicts its content badly
+    enough to correct. `name` is the output path or basename as it currently
+    stands (its .cryptedmicro suffix already removed).
+
+    Returns None to leave the name as it is, or a dict describing the fix:
+        {"old": <current ext, no dot>, "new": <corrected ext, no dot>,
+         "category": <detected category>}
+
+    Conservative by design. Only a genuine cross category swap triggers a
+    rename. Same category disagreements, alias pairs and container families are
+    all left alone, as is anything the detector cannot place.
+    """
+    ext, cat = detect_content_type(head)
+    if not ext or cat in (None, "other"):
+        return None                       # cannot tell, or not a hard category
+    cur = os.path.splitext(name)[1].lstrip(".").lower()
+    if not cur:
+        return None                       # no extension present, nothing swapped
+    if cur == ext:
+        return None
+    if cur in _ALIASES.get(ext, ()):      # same format under another name
+        return None
+    if ext == "zip" and cur in _ZIP_FAMILY:
+        return None                       # generic zip vs a real zip container
+    if ext in _FTYP_FAMILY and cur in _FTYP_FAMILY:
+        return None
+    if ext in _RIFF_FAMILY and cur in _RIFF_FAMILY:
+        return None
+    if _CATEGORY_BY_EXT.get(cur, "other") == cat:
+        return None                       # same category, not a category swap
+    return {"old": cur, "new": ext, "category": cat}
+
+
+# ===========================================================================
 # SECTION 9. Main
 # ===========================================================================
 
@@ -1597,8 +2316,19 @@ def main(argv=None):
                             "modelled on this crew's key history")
     g_key.add_argument("--deep", action="store_true",
                        help="with --brute, widen every generator. Hours, not seconds")
-    g_key.add_argument("--workers", type=int, default=1,
-                       help="parallel processes for the sweep")
+    g_key.add_argument("--workers", type=int, default=None, metavar="N",
+                       help="parallel worker processes for the sweep. Defaults to "
+                            "every CPU core on this machine, to push the guessing "
+                            "as fast as the hardware allows. Set 1 to stay "
+                            "single-process, e.g. to keep a victim machine responsive")
+    g_key.add_argument("--gpu", action="store_true",
+                       help="use an OpenCL GPU (NVIDIA or AMD) for the sweep. Needs "
+                            "pyopencl and OpenCL drivers. Runs an AES self-test "
+                            "against the CPU first and falls back to the CPU unless "
+                            "it passes, so it can never return a wrong result or "
+                            "miss a key")
+    g_key.add_argument("--gpu-info", dest="gpu_info", action="store_true",
+                       help="list the OpenCL platforms and devices found, and exit")
     g_key.add_argument("--max-passes", type=int, default=8,
                        help="how many times to sweep for keys. One pass can "
                             "turn up several keys; each extra pass targets "
@@ -1607,6 +2337,35 @@ def main(argv=None):
                             "(default 8, 1 disables the extra passes)")
     g_key.add_argument("--max-candidates", type=int,
                        help="give up after this many guesses")
+    g_key.add_argument("--dumb-brute", dest="dumb_brute", action="store_true",
+                       help="classic incremental brute force: every string from "
+                            "3 characters up to the longest recovered key, over "
+                            "the Turkish+English alphabet these operators type. "
+                            "Follows the structure of the known keys, not a "
+                            "dictionary. Exhaustive, so only the short lengths "
+                            "finish; it pauses and asks before a length that "
+                            "would take too long. Runs after --brute")
+    g_key.add_argument("--charset", choices=("observed", "turkish", "full"),
+                       default="turkish",
+                       help="alphabet for --dumb-brute: 'observed' only the "
+                            "characters in the recovered keys, 'turkish' (default) "
+                            "adds Turkish and English lowercase and digits, 'full' "
+                            "adds uppercase too. Wider is more coverage but a much "
+                            "bigger search")
+    g_key.add_argument("--scavenge", action="append", default=[], metavar="FILE",
+                       help="pull candidate keys out of an UNENCRYPTED dump (a "
+                            "memory image, pagefile, hibernation file, strings "
+                            "listing or implant log) and try them first. The key "
+                            "is a typed string and often survives there in the "
+                            "clear. Repeatable. Never point this at an encrypted file")
+    g_key.add_argument("--checkpoint", metavar="FILE",
+                       help="save sweep progress to FILE and resume from it if it "
+                            "already exists, so an interrupted or --max-candidates "
+                            "stopped run continues instead of starting over")
+    g_key.add_argument("--seen-cap", dest="seen_cap", type=int, metavar="N",
+                       help="cap each generator's duplicate-suppression set at N "
+                            "entries (default %d). Lower it on a low-memory "
+                            "machine" % SEEN_CAP)
     g_key.add_argument("--list-keys", action="store_true",
                        help="print the built in known keys and exit")
 
@@ -1624,13 +2383,23 @@ def main(argv=None):
     g_out.add_argument("--strict", action="store_true",
                        help="do not write anything that failed structural verification, "
                             "even under a key already proven on this machine")
-    g_out.add_argument("--fix-ext", action="store_true",
-                       help="correct extensions that disagree with the recovered magic bytes")
+    g_out.add_argument("--fix-ext", dest="fix_ext", action="store_true", default=True,
+                       help="correct extensions that disagree with the recovered "
+                            "content. On by default; this flag is kept for "
+                            "compatibility and is now a no-op")
+    g_out.add_argument("--no-fix-ext", dest="fix_ext", action="store_false",
+                       help="do not correct swapped extensions. By default a "
+                            "recovered file whose content is a different category "
+                            "from its name (this crew randomises extensions) is "
+                            "written under its true extension and the swap reported")
     g_out.add_argument("--force", action="store_true",
                        help="apply a single supplied key without header checking")
     g_out.add_argument("--pure-python", action="store_true",
                        help="ignore installed crypto libraries and use the built in AES")
     g_out.add_argument("--quiet", action="store_true", help="less output")
+    g_out.add_argument("-y", "--yes", action="store_true",
+                       help="answer yes to prompts, such as continuing "
+                            "--dumb-brute into a long length. For unattended runs")
     ap.add_argument("--version", action="version", version="unmicro.py " + VERSION)
     args = ap.parse_args(argv)
 
@@ -1639,19 +2408,69 @@ def main(argv=None):
             print(k)
         return 0
 
+    if args.gpu_info:
+        try:
+            import pyopencl as cl
+        except Exception:
+            print("pyopencl is not installed.  pip install pyopencl")
+            return 1
+        plats = cl.get_platforms()
+        if not plats:
+            print("No OpenCL platforms found. Install your NVIDIA or AMD OpenCL runtime.")
+            return 1
+        for p in plats:
+            print("Platform: %s (%s)" % (p.name.strip(), p.vendor.strip()))
+            for d in p.get_devices():
+                try:
+                    kind = cl.device_type.to_string(d.type)
+                except Exception:
+                    kind = "?"
+                print("    %-8s %s" % (kind, d.name.strip()))
+        return 0
+
     _init_backend(args.pure_python)
 
-    if not args.src and not args.auto:
-        ap.error("give --in PATH or --auto")
-    if not args.identify and not args.dst:
-        ap.error("--out is required unless you pass --identify")
-    if args.brute and BACKEND == "pure-python" and not args.quiet:
+    if args.seen_cap:
+        globals()["SEEN_CAP"] = max(1000, args.seen_cap)
+
+    # A bare run with no source and no strategy is meant to just go: search the
+    # whole machine, try every route, and drop what it recovers into a folder it
+    # makes. Naming a source, a strategy or an output turns the matching default
+    # off, so an explicit invocation behaves exactly as before.
+    full_auto = not args.src and not args.auto
+    if full_auto:
+        args.auto = True
+        if not (args.brute or args.deep or args.dumb_brute or args.key
+                or args.wordlist or args.scavenge or args.force):
+            args.brute = True
+            args.dumb_brute = True
+    default_out = not args.identify and not args.dst
+    if default_out:
+        args.dst = DEFAULT_OUT_DIR
+
+    if (args.brute or args.dumb_brute) and BACKEND == "pure-python" and not args.quiet:
         print("Note: no crypto library installed, so guessing will be very slow.")
         print("      pip install pycryptodome makes --brute thousands of times faster.")
         print()
 
     if not args.quiet:
         print("unmicro.py %s   AES back end: %s" % (VERSION, BACKEND))
+        if args.fix_ext and not args.identify:
+            if HAVE_FILETYPE:
+                print("Extension repair on. Type detection: filetype %s."
+                      % FILETYPE_VERSION)
+            else:
+                print("Extension repair on, but the filetype library is not installed,")
+                print("so detection falls back to the smaller built in table. For full")
+                print("coverage: pip install filetype")
+        if full_auto:
+            print("No options given, so running full-auto: searching every drive,")
+            print("trying the recovered keys, the fitted model and the structural")
+            print("brute. Point --in at a folder to narrow it, or --identify to")
+            print("only locate keys.")
+        if default_out:
+            print("Recovered files will be written to ./%s (created for you)."
+                  % DEFAULT_OUT_DIR)
         print("Your encrypted files will not be modified, renamed or deleted.")
         print()
 
@@ -1690,29 +2509,99 @@ def main(argv=None):
             wordlist = [ln.rstrip("\r\n") for ln in fh if ln.strip()]
 
     forced = False
-    if args.force and len(args.key) == 1 and not args.brute and not wordlist:
+    if (args.force and len(args.key) == 1 and not args.brute
+            and not args.dumb_brute and not wordlist and not args.scavenge):
         mapping = {args.key[0]: files}
         forced = True
         if not args.quiet:
             print("Forced key %r applied to all %d files without header checking."
                   % (args.key[0], len(files)))
     else:
-        plan = build_plan(brute=args.brute, deep=args.deep,
-                          extra=args.key, wordlist=wordlist)
+        model = get_model()
+        dumb_alpha_n = len(model.dumb_alphabet(args.charset))
+        plan = build_plan(brute=args.brute, deep=args.deep, dumb=args.dumb_brute,
+                          extra=args.key, wordlist=wordlist,
+                          scavenged=args.scavenge, dumb_charset=args.charset)
+
+        # Gate for the structural brute. Each length is its own tier, costing
+        # alphabet ** length. Before a length that would take a long time, stop
+        # and lay out the situation: on a terminal ask whether to go on;
+        # unattended, stop unless --yes was given or --max-candidates bounds it.
+        # This is where "climb to the longest key, then ask" actually bites,
+        # since the tractable wall arrives well before length 23 over a
+        # Turkish+English alphabet.
+        gate_at = 50_000_000
+        interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+        def gate(name, tier_idx):
+            if not name.startswith("structural brute len="):
+                return True
+            length = int(name.rsplit("=", 1)[1])
+            size = dumb_alpha_n ** length
+            if size <= gate_at or args.yes:
+                return True
+            rate = 150000.0 if BACKEND != "pure-python" else 2000.0
+            secs = size / rate
+            when = ("%.0f seconds" % secs if secs < 90 else
+                    "%.1f minutes" % (secs / 60.0) if secs < 5400 else
+                    "%.1f hours" % (secs / 3600.0) if secs < 172800 else
+                    "%.1f days" % (secs / 86400.0))
+            print()
+            print("Structural brute has cleared every key shorter than %d "
+                  "characters with" % length)
+            print("no match. Length %d is %s candidates over a %d-character "
+                  "alphabet," % (length, "{:,}".format(size), dumb_alpha_n))
+            print("roughly %s at this machine's rate, and each further length is"
+                  % when)
+            print("dramatically larger.")
+            if not interactive:
+                print("Not a terminal, so stopping here. Re-run with --yes to let it")
+                print("continue, --max-candidates N to bound it, or --checkpoint FILE")
+                print("to make it resumable.")
+                return False
+            try:
+                ans = input("Continue into length %d? [y/N] " % length).strip().lower()
+            except EOFError:
+                return False
+            return ans in ("y", "yes")
+
+        # Default to every core, so the guessing runs as fast as the hardware
+        # allows. --workers 1 opts back into a single process.
+        workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
+        gpu = init_gpu(quiet=args.quiet) if args.gpu else None
         if not args.quiet:
-            print("Trying keys%s:" % (" (brute force enabled)" if args.brute else ""))
+            routes = []
+            if args.scavenge:
+                routes.append("scavenged strings")
+            if args.brute:
+                routes.append("fitted model")
+            if args.dumb_brute:
+                routes.append("structural brute, %s alphabet" % args.charset)
+            if gpu is not None:
+                routes.append("GPU: %s" % gpu.name)
+            elif workers > 1:
+                routes.append("%d workers" % workers)
+            tail = (" (%s)" % ", ".join(routes)) if routes else ""
+            print("Trying keys%s:" % tail)
         mapping, tried, unmatched = find_all_keys(
-            files, plan, workers=max(1, args.workers),
+            files, plan, workers=workers,
             limit=args.max_candidates, quiet=args.quiet,
-            max_passes=max(1, args.max_passes))
+            max_passes=max(1, args.max_passes),
+            checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu)
         if not mapping:
             print()
             print("No key opened any file after %d candidate(s)." % tried)
             print()
             if not args.brute:
-                print("Next step: re-run with --brute to sweep generated candidates.")
+                print("Next step: re-run with --brute to sweep modelled candidates.")
+            elif not args.dumb_brute:
+                print("Next step: add --dumb-brute for a plain structural brute, and")
+                print("           --checkpoint FILE so a long run can resume.")
             else:
-                print("Next step: --brute --deep --workers 4, and leave it running.")
+                print("Next step: --deep widens the model, --charset full widens the")
+                print("           brute. Best odds: --scavenge FILE on a memory image,")
+                print("           pagefile or hibernation file, which is where a typed")
+                print("           key most often survives in the clear.")
             print()
             print("What this does and does not mean:")
             print("  * The key is a string the operator typed. It is not derived from")
@@ -1761,6 +2650,8 @@ def main(argv=None):
     # --- decrypt -----------------------------------------------------------
     os.makedirs(long_path(args.dst), exist_ok=True)
     recovered = unverified = failed = 0
+    ext_fixed = 0
+    ext_fix_log = []
     handled = set()
 
     # A key is proven once any one file under it validates structurally. From
@@ -1799,10 +2690,9 @@ def main(argv=None):
 
             label, canon = identify(pt[:16])
             dest = mirrored_path(args.dst, path, flat=args.flat)
-            if args.fix_ext and canon:
-                stem, cur = os.path.splitext(dest)
-                if cur.lower() != canon and not (canon == ".jpg" and cur.lower() == ".jpeg"):
-                    dest = stem + canon
+            fix = plan_extension_fix(dest, pt[:_DETECT_HEAD]) if args.fix_ext else None
+            if fix:
+                dest = os.path.splitext(dest)[0] + "." + fix["new"]
             if not verified and not forced:
                 dest += ".UNVERIFIED"
             # One destination that cannot be written must not end the run.
@@ -1848,6 +2738,17 @@ def main(argv=None):
                           % (os.path.basename(dest)[:56], len(pt),
                              "key proven on this machine, structure not checked"))
 
+            if fix:
+                ext_fixed += 1
+                ext_fix_log.append((os.path.basename(dest), fix["old"],
+                                    fix["new"], fix["category"]))
+                if not args.quiet:
+                    print("         ^ EXTENSION SWAP FIXED: named .%s, contents are "
+                          "%s (%s). Renamed the recovered copy; corrected from the"
+                          % (fix["old"], fix["new"].upper(), fix["category"]))
+                    print("           decrypted bytes. Dev7 randomised this extension; "
+                          "your encrypted original is untouched.")
+
     leftover = [f for f in files if f not in handled]
 
     print()
@@ -1858,12 +2759,27 @@ def main(argv=None):
               else "  (proven key, structure not checked, .UNVERIFIED suffix)"))
     if failed:
         print("Failed                 : %d" % failed)
+    if ext_fixed:
+        print("Extension swaps fixed  : %d" % ext_fixed)
     if leftover:
         print("No key found for       : %d" % len(leftover))
         for f in leftover[:20]:
             print("    %s" % f)
         if len(leftover) > 20:
             print("    ... and %d more" % (len(leftover) - 20))
+    if ext_fixed:
+        print()
+        print("Extension swaps: %d recovered file(s) were saved under an extension"
+              % ext_fixed)
+        print("that did not match their contents. This crew randomises extensions")
+        print("before encrypting (a video named .jpg, an archive named .png), so each")
+        print("was renamed from its decrypted bytes. The rename is on the recovered")
+        print("copy only; your encrypted originals are untouched. Examples:")
+        for shown, old, new, category in ext_fix_log[:10]:
+            print("    .%-5s -> .%-5s  %-11s %s" % (old, new, category, shown[:48]))
+        if len(ext_fix_log) > 10:
+            print("    ... and %d more" % (len(ext_fix_log) - 10))
+
     print()
     print("Verified means the padding parsed, the length matched, and the file")
     print("structure checked out: CRCs, terminators and length fields, not just")
