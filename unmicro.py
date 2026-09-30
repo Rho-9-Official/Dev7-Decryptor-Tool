@@ -157,7 +157,7 @@ except Exception:
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
 
-VERSION = "3.5"
+VERSION = "3.6"
 EXT = ".cryptedmicro"
 
 WINDOWS = os.name == "nt"
@@ -1629,7 +1629,7 @@ def _ckpt_clear(path):
         pass
 
 
-def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000,
+def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=65536,
           checkpoint=None, on_tier_start=None, gpu=None):
     """
     Run the tiers in order against the probe blocks. Stops at the first tier
@@ -1690,6 +1690,54 @@ def sweep(files, plan, workers=1, limit=None, quiet=False, chunk_size=20000,
                 # resume comes back to exactly here, and stop.
                 _ckpt_save(checkpoint, sig, name, 0, tried)
                 return [], tried
+
+            # GPU-native structural brute: the device generates the candidates,
+            # so we never feed it from Python. This is the fast path.
+            if (gpu is not None and gpu.alphabet is not None
+                    and name.startswith("structural brute len=")):
+                length = int(name.rsplit("=", 1)[1])
+                total = gpu._N ** length
+                consumed = start_consumed if tier_idx == start_tier else 0
+                tier_start = tried
+                confirmed = []
+                gpu_batch = 1 << 24
+                while consumed < total:
+                    count = min(gpu_batch, total - consumed)
+                    if limit:
+                        room = limit - tried
+                        if room <= 0:
+                            _ckpt_save(checkpoint, sig, name, consumed, tried)
+                            return [], tried
+                        count = min(count, room)
+                    for h in gpu.brute_length(length, probes, consumed, count):
+                        if h not in confirmed and any(confirm_key(h, p) for _, p in probes):
+                            confirmed.append(h)
+                    tried += count
+                    consumed += count
+                    _ckpt_save(checkpoint, sig, name, consumed, tried)
+                    if not quiet:
+                        rate = tried / max(time.time() - t0, 0.001)
+                        sys.stderr.write("  %-26s %13d tried  %9.0f/s\r"
+                                         % (name[:26], tried, rate))
+                        sys.stderr.flush()
+                    if confirmed:
+                        break
+                    if limit and tried >= limit:
+                        if not quiet:
+                            sys.stderr.write(" " * 72 + "\r")
+                        return [], tried
+                if not quiet:
+                    sys.stderr.write(" " * 72 + "\r")
+                    sys.stderr.flush()
+                    print("  tier %-30s %13d candidates  %s"
+                          % (name, tried - tier_start, "HIT" if confirmed else "no hit"))
+                if confirmed:
+                    _ckpt_clear(checkpoint)
+                    return confirmed, tried
+                nxt = plan[tier_idx + 1][0] if tier_idx + 1 < len(plan) else name
+                _ckpt_save(checkpoint, sig, nxt, 0, tried)
+                continue
+
             gen = factory()
             consumed = 0
             if tier_idx == start_tier and start_consumed:
@@ -1939,16 +1987,11 @@ inline uchar gmul(uchar a, uchar b){
     return p;
 }
 
-__kernel void aes256_ecb_decrypt(__global const uchar* keys,
-                                 __global const uchar* ct,
-                                 __global uchar* out,
-                                 const uint n){
-    uint gid = get_global_id(0);
-    if(gid >= n) return;
-    __global const uchar* k = keys + (uint)gid*32;
-
+/* AES-256-ECB single block decrypt. All args private. This is the one place
+   the cipher lives; both kernels below call it. */
+void aes256_decrypt(const uchar* key, const uchar* ct, uchar* out){
     uchar rk[240];
-    for(int i=0;i<32;i++) rk[i] = k[i];
+    for(int i=0;i<32;i++) rk[i] = key[i];
     int rconi = 1;
     for(int i=8;i<60;i++){
         uchar t0=rk[(i-1)*4+0], t1=rk[(i-1)*4+1], t2=rk[(i-1)*4+2], t3=rk[(i-1)*4+3];
@@ -1962,7 +2005,6 @@ __kernel void aes256_ecb_decrypt(__global const uchar* keys,
         rk[i*4+0]=rk[(i-8)*4+0]^t0; rk[i*4+1]=rk[(i-8)*4+1]^t1;
         rk[i*4+2]=rk[(i-8)*4+2]^t2; rk[i*4+3]=rk[(i-8)*4+3]^t3;
     }
-
     uchar s[16], t[16];
     for(int i=0;i<16;i++) s[i] = ct[i] ^ rk[14*16 + i];
     for(int round=13; round>=1; round--){
@@ -1979,14 +2021,99 @@ __kernel void aes256_ecb_decrypt(__global const uchar* keys,
     }
     for(int r=0;r<4;r++) for(int c=0;c<4;c++) t[r + 4*((c+r)&3)] = s[r + 4*c];
     for(int i=0;i<16;i++) t[i] = ISBOX[t[i]];
-    for(int i=0;i<16;i++) out[(uint)gid*16 + i] = t[i] ^ rk[0*16 + i];
+    for(int i=0;i<16;i++) out[i] = t[i] ^ rk[0*16 + i];
+}
+
+/* Batch decrypt: one supplied 32-byte key per work-item. Used by filter_chunk
+   and by the AES self-test. */
+__kernel void aes256_ecb_decrypt(__global const uchar* keys,
+                                 __global const uchar* ct,
+                                 __global uchar* out,
+                                 const uint n){
+    uint gid = get_global_id(0);
+    if(gid >= n) return;
+    uchar key[32], c[16], o[16];
+    for(int i=0;i<32;i++) key[i] = keys[(uint)gid*32 + i];
+    for(int i=0;i<16;i++) c[i] = ct[i];
+    aes256_decrypt(key, c, o);
+    for(int i=0;i<16;i++) out[(uint)gid*16 + i] = o[i];
+}
+
+/* On-device structural brute. Each work-item turns its own index into a
+   candidate over the alphabet, builds the key, decrypts, and checks the magic
+   table, writing only the indices that hit. No candidate ever crosses the bus,
+   which is what lets this run at GPU speed instead of at Python speed.
+
+   idx = start + gid, decomposed mixed-radix over the alphabet (position 0 of
+   the string is most significant). Each character contributes its UTF-8 bytes,
+   packed into the 32-byte key exactly as key_bytes() does on the host. */
+__kernel void aes256_brute_mask(
+        __global const uchar* alpha,  __global const uint*  aoff,
+        __global const uchar* alen,   const uint N, const uint L,
+        const ulong start, const uint count,
+        __global const uchar* ct,
+        __global const uchar* mbytes, __global const uint* moff,
+        __global const uchar* mat,    __global const uchar* mlen, const uint M,
+        __global uint* out_idx, volatile __global uint* out_cnt, const uint out_cap){
+    uint gid = get_global_id(0);
+    if(gid >= count) return;
+    ulong idx = start + (ulong)gid;
+
+    uchar d[32];
+    ulong rem = idx;
+    for(uint p=0;p<L;p++){ d[p] = (uchar)(rem % (ulong)N); rem /= (ulong)N; }
+
+    uchar key[32];
+    for(int i=0;i<32;i++) key[i] = 0;
+    uint kb = 0;
+    for(uint s=0;s<L;s++){
+        uint ci = d[L-1-s];
+        uint off = aoff[ci];
+        uint ln  = alen[ci];
+        for(uint b=0;b<ln;b++){ if(kb<32){ key[kb] = alpha[off+b]; kb++; } }
+    }
+
+    uchar c[16]; for(int i=0;i<16;i++) c[i] = ct[i];
+    uchar pt[16]; aes256_decrypt(key, c, pt);
+
+    for(uint m=0;m<M;m++){
+        uint at=mat[m], ln=mlen[m], mo=moff[m];
+        bool ok = true;
+        for(uint b=0;b<ln;b++){ if(pt[at+b] != mbytes[mo+b]){ ok=false; break; } }
+        if(ok){
+            uint slot = atomic_inc(out_cnt);
+            if(slot < out_cap) out_idx[slot] = gid;
+            return;
+        }
+    }
 }
 """
 
 
+# Minimum magic length the GPU brute flags on. Short magics (BM, MZ, gzip) match
+# random data often enough that, at GPU speed, the coincidental hits would flood
+# the CPU confirm step. 3+ byte magics almost never collide, so the CPU confirm
+# stays cheap; a rare file type whose only signature is 2 bytes is still covered
+# by the CPU tiers. This never causes a miss on the common strong-magic types.
+_GPU_MIN_MAGIC = 3
+
+
+def _decode_index(idx, alphabet, length):
+    """Turn a candidate index into its string, identically to the GPU kernel:
+    mixed-radix over the alphabet, string position 0 most significant."""
+    n = len(alphabet)
+    d = [0] * length
+    rem = idx
+    for p in range(length):
+        d[p] = rem % n
+        rem //= n
+    return "".join(alphabet[d[length - 1 - s]] for s in range(length))
+
+
 class GpuAES(object):
-    """OpenCL AES-256-ECB block decryption for the sweep. Decrypt only, like the
-    rest of this file. Trusted only after selftest() matches the CPU back end."""
+    """OpenCL AES-256 for the sweep: batch block decrypt (filter_chunk) and an
+    on-device structural brute (brute_length). Decrypt only, like the rest of
+    this file. Trusted only after selftest() and mask_selftest() match the CPU."""
 
     def __init__(self):
         import pyopencl as cl
@@ -2006,9 +2133,36 @@ class GpuAES(object):
         self.ctx = cl.Context([self.device])
         self.queue = cl.CommandQueue(self.ctx)
         self.prog = cl.Program(self.ctx, _gpu_kernel_source()).build()
-        # offset-0..4 magics from the signature table, for a fast numpy prefilter
+        # magics for the numpy prefilter used by filter_chunk (all, off<=12)
         self._magics = [(off, np.frombuffer(magic, dtype=np.uint8))
                         for off, magic, _, _ in SIGNATURES if off + len(magic) <= 16]
+        # flat magic table for the on-device brute kernel (strong magics only)
+        mb, mo, mat, mlen = [], [], [], []
+        for off, magic, _, _ in SIGNATURES:
+            if off + len(magic) <= 16 and len(magic) >= _GPU_MIN_MAGIC:
+                mo.append(len(mb)); mat.append(off); mlen.append(len(magic))
+                mb.extend(magic)
+        self._mbytes = np.array(mb or [0], dtype=np.uint8)
+        self._moff = np.array(mo or [0], dtype=np.uint32)
+        self._mat = np.array(mat or [0], dtype=np.uint8)
+        self._mlen = np.array(mlen or [0], dtype=np.uint8)
+        self._M = len(mo)
+        self.alphabet = None
+
+    def set_alphabet(self, alphabet):
+        """Pack the brute alphabet (list of one-character strings) for the
+        kernel: each character's UTF-8 bytes, with per-character offsets and
+        lengths, so multi-byte Turkish letters are handled correctly."""
+        np = self.np
+        self.alphabet = list(alphabet)
+        ab, ao, al = [], [], []
+        for ch in self.alphabet:
+            b = ch.encode("utf-8")
+            ao.append(len(ab)); al.append(len(b)); ab.extend(b)
+        self._alpha = np.array(ab, dtype=np.uint8)
+        self._aoff = np.array(ao, dtype=np.uint32)
+        self._alen = np.array(al, dtype=np.uint8)
+        self._N = len(self.alphabet)
 
     def decrypt_blocks(self, keys, ct16):
         """keys: uint8 [n,32]; ct16: 16 raw bytes. Returns uint8 [n,16]."""
@@ -2051,6 +2205,66 @@ class GpuAES(object):
             for off, magic in self._magics:
                 flagged |= np.all(out[:, off:off + len(magic)] == magic, axis=1)
         return [candidates[i] for i in np.nonzero(flagged)[0]]
+
+    def brute_length(self, length, probes, start, count, out_cap=1 << 16):
+        """Enumerate candidates [start, start+count) of `length` characters over
+        the alphabet ON THE DEVICE, across every probe block, and return the
+        candidate strings that carried a magic (union over probes) for the CPU
+        to confirm. Nothing but hit indices crosses the bus."""
+        cl, np = self.cl, self.np
+        mf = cl.mem_flags
+        RO = mf.READ_ONLY | mf.COPY_HOST_PTR
+        a_b = cl.Buffer(self.ctx, RO, hostbuf=self._alpha)
+        a_o = cl.Buffer(self.ctx, RO, hostbuf=self._aoff)
+        a_l = cl.Buffer(self.ctx, RO, hostbuf=self._alen)
+        m_b = cl.Buffer(self.ctx, RO, hostbuf=self._mbytes)
+        m_o = cl.Buffer(self.ctx, RO, hostbuf=self._moff)
+        m_a = cl.Buffer(self.ctx, RO, hostbuf=self._mat)
+        m_l = cl.Buffer(self.ctx, RO, hostbuf=self._mlen)
+        hit = set()
+        for blk, _ in probes:
+            ctnp = np.frombuffer(blk, dtype=np.uint8).copy()
+            c_b = cl.Buffer(self.ctx, RO, hostbuf=ctnp)
+            out_idx = np.empty(out_cap, dtype=np.uint32)
+            out_cnt = np.zeros(1, dtype=np.uint32)
+            oi = cl.Buffer(self.ctx, mf.WRITE_ONLY, out_idx.nbytes)
+            oc = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=out_cnt)
+            self.prog.aes256_brute_mask(
+                self.queue, (int(count),), None,
+                a_b, a_o, a_l, np.uint32(self._N), np.uint32(length),
+                np.uint64(start), np.uint32(count),
+                c_b, m_b, m_o, m_a, m_l, np.uint32(self._M),
+                oi, oc, np.uint32(out_cap))
+            cl.enqueue_copy(self.queue, out_cnt, oc)
+            self.queue.finish()
+            n = int(out_cnt[0])
+            if n:
+                cl.enqueue_copy(self.queue, out_idx, oi)
+                self.queue.finish()
+                for g in out_idx[:min(n, out_cap)]:
+                    hit.add(int(g))
+        return [_decode_index(start + g, self.alphabet, length) for g in sorted(hit)]
+
+    def mask_selftest(self, length=4, sample=200000):
+        """Run the on-device brute over the first `sample` candidates against a
+        random block and require the GPU's hit set to equal an independent CPU
+        hit set over the same candidates. Validates index decode, key build, AES
+        and the magic check together, on this device."""
+        if self.alphabet is None or self._M == 0:
+            return False
+        sample = int(min(sample, self._N ** length))
+        ct = os.urandom(16)
+        gpu_hits = set(self.brute_length(length, [(ct, None)], 0, sample))
+        strong = [(off, m) for off, m in self._magics if len(m) >= _GPU_MIN_MAGIC]
+        cpu_hits = set()
+        for idx in range(sample):
+            cand = _decode_index(idx, self.alphabet, length)
+            pt = _dec_blocks(key_bytes(cand), ct)
+            for off, magic in strong:
+                if pt[off:off + len(magic)] == bytes(magic):
+                    cpu_hits.add(cand)
+                    break
+        return gpu_hits == cpu_hits
 
 
 def init_gpu(quiet=False):
@@ -2518,19 +2732,45 @@ def main(argv=None):
                   % (args.key[0], len(files)))
     else:
         model = get_model()
-        dumb_alpha_n = len(model.dumb_alphabet(args.charset))
+        dumb_alpha = model.dumb_alphabet(args.charset)
+        dumb_alpha_n = len(dumb_alpha)
         plan = build_plan(brute=args.brute, deep=args.deep, dumb=args.dumb_brute,
                           extra=args.key, wordlist=wordlist,
                           scavenged=args.scavenge, dumb_charset=args.charset)
+
+        # Default to every core, so the guessing runs as fast as the hardware
+        # allows. --workers 1 opts back into a single process.
+        workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
+
+        # Bring up the GPU (if asked) before the gate, so the gate can size the
+        # length wall against GPU throughput. For the structural brute, prove
+        # the on-device brute against the CPU as well as the raw AES; a failure
+        # drops back to the CPU rather than risk a device that misses the key.
+        gpu = init_gpu(quiet=args.quiet) if args.gpu else None
+        if gpu is not None and args.dumb_brute:
+            gpu.set_alphabet(dumb_alpha)
+            try:
+                brute_ok = gpu.mask_selftest(length=3)
+            except Exception as e:
+                brute_ok = False
+                if not args.quiet:
+                    print("GPU brute self-test could not run (%s)." % e)
+            if not brute_ok:
+                if not args.quiet:
+                    print("GPU brute self-test FAILED against the CPU, so the whole")
+                    print("sweep falls back to the CPU. Please report this device.")
+                    print()
+                gpu = None
+            elif not args.quiet:
+                print("GPU brute self-test passed (on-device candidates match the CPU).")
 
         # Gate for the structural brute. Each length is its own tier, costing
         # alphabet ** length. Before a length that would take a long time, stop
         # and lay out the situation: on a terminal ask whether to go on;
         # unattended, stop unless --yes was given or --max-candidates bounds it.
-        # This is where "climb to the longest key, then ask" actually bites,
-        # since the tractable wall arrives well before length 23 over a
-        # Turkish+English alphabet.
-        gate_at = 50_000_000
+        gpu_active = gpu is not None
+        gate_at = (5 * 10 ** 11) if gpu_active else 50_000_000
+        gate_rate = 3.0e8 if gpu_active else (150000.0 if BACKEND != "pure-python" else 2000.0)
         interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
 
         def gate(name, tier_idx):
@@ -2540,8 +2780,7 @@ def main(argv=None):
             size = dumb_alpha_n ** length
             if size <= gate_at or args.yes:
                 return True
-            rate = 150000.0 if BACKEND != "pure-python" else 2000.0
-            secs = size / rate
+            secs = size / gate_rate
             when = ("%.0f seconds" % secs if secs < 90 else
                     "%.1f minutes" % (secs / 60.0) if secs < 5400 else
                     "%.1f hours" % (secs / 3600.0) if secs < 172800 else
@@ -2564,11 +2803,6 @@ def main(argv=None):
             except EOFError:
                 return False
             return ans in ("y", "yes")
-
-        # Default to every core, so the guessing runs as fast as the hardware
-        # allows. --workers 1 opts back into a single process.
-        workers = args.workers if args.workers and args.workers > 0 else (os.cpu_count() or 1)
-        gpu = init_gpu(quiet=args.quiet) if args.gpu else None
         if not args.quiet:
             routes = []
             if args.scavenge:

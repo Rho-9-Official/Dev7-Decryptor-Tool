@@ -368,7 +368,7 @@ These are real and are not regressions:
 
 ---
 
-## What's new in 3.5
+## What's new
 
 - **Extension repair.** Recovered files are written under their true extension.
   This crew randomises extensions before encrypting (a video named `.jpg`), so
@@ -389,35 +389,52 @@ These are real and are not regressions:
   route, and writes to `./unmicro-recovered`.
 - **All cores by default.** `--workers` now defaults to every CPU core; set 1 to
   stay single-process.
-- **`--gpu` (experimental).** OpenCL sweep for NVIDIA and AMD, self-tested
-  against the CPU. See below.
+- **`--gpu` with an on-device structural brute (experimental, 3.6).** OpenCL for
+  NVIDIA and AMD. The GPU generates the candidates itself, so `--dumb-brute`
+  runs at device speed instead of being fed from one Python thread. See below.
 
 ## GPU acceleration (optional, experimental)
 
 The sweep is one AES-256 decrypt per candidate, which is exactly what a GPU is
-good at. `--gpu` runs the guessing on an OpenCL device, which covers both NVIDIA
-and AMD from one kernel.
+good at. The catch is feeding it: a single Python thread can only produce a few
+hundred thousand candidates a second, which would starve any GPU. So for the
+structural brute (`--dumb-brute`), **the GPU generates the candidates itself** —
+each work item turns its own index into a candidate, builds the key, decrypts,
+and checks the result. Nothing but the rare hit crosses the bus, so it runs at
+the card's speed. One OpenCL kernel covers both NVIDIA and AMD.
+
+**Run it from the Python source, not the released `.exe`.** The GPU needs
+`pyopencl` and your GPU's OpenCL runtime, which the standalone binary does not
+bundle (and most victim machines do not have). GPU is the operator's cracking
+path:
 
 ```
-pip install pyopencl        # plus your NVIDIA or AMD OpenCL runtime
-python3 unmicro.py --gpu-info                       # what OpenCL sees
-python3 unmicro.py --in ./encrypted --out ./rec --brute --gpu
+pip install pyopencl numpy      # plus your NVIDIA or AMD OpenCL runtime
+python3 unmicro.py --gpu-info                        # what OpenCL sees
+python3 unmicro.py --in ./encrypted --out ./rec --dumb-brute --gpu
 ```
+
+The fitted-model tier stays on the CPU (its candidates come from Python logic
+that does not map to a GPU); the big win is the structural brute.
 
 It is opt-in, and safe by construction for a recovery tool. Key derivation stays
-on the CPU, so nothing is mis-encoded on the device. Before the GPU is trusted
-for a single real candidate, it decrypts random blocks under random keys and
-compares every byte against the CPU AES back end; a single mismatch disables the
-GPU and the run continues on the CPU. Every GPU hit is re-decrypted and
-re-validated on the CPU before it counts. So the GPU can make the search faster,
-or on hardware where the kernel does not hold up simply not engage. It cannot
-make the search wrong or cause a key to be missed.
+on the CPU, so nothing is mis-encoded on the device. Two self-tests run before
+the GPU is trusted for a single real candidate: it decrypts random blocks under
+random keys and requires every byte to match the CPU AES back end, and it runs
+the on-device brute over a sample and requires its hit set to equal the CPU's
+over the same candidates. Any mismatch disables the GPU and the whole run
+continues on the CPU, and every GPU hit is re-validated on the CPU before it
+counts. So the GPU can make the search faster, or on hardware where the kernel
+does not hold up simply not engage. It cannot make the search wrong or miss a
+key.
 
-This path is **new and experimental in 3.5**. The kernel's AES-256 logic was
-verified against a reference AES on random vectors, but the OpenCL execution
-itself should be confirmed on your own card: run `--gpu` and look for the line
-`GPU ready: <device> (AES self-test passed against the CPU back end)`. If you
-see a self-test failure instead, it has already fallen back to the CPU.
+This path is **new and experimental in 3.6**, and it was developed without a GPU
+in the build environment. The kernel's AES-256 logic and the index-to-candidate
+brute were verified against a reference implementation on random vectors, but
+the OpenCL execution itself should be confirmed on your own card: run `--gpu`
+and look for `GPU ready: …` followed by `GPU brute self-test passed`. If you see
+a self-test failure instead, it has already fallen back to the CPU; please
+report the device.
 
 ## Options worth knowing
 

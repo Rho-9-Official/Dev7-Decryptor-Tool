@@ -2,6 +2,37 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.6
+
+GPU throughput for the structural brute.
+
+### Added
+- **On-device structural brute for `--gpu`.** The bottleneck for GPU
+  acceleration was feeding it: one Python thread produces only a few hundred
+  thousand candidates a second. Now, for `--dumb-brute`, the GPU generates the
+  candidates itself — each work item turns its index into a candidate over the
+  alphabet, builds the key, decrypts, and checks the magic table in-kernel,
+  writing back only hits. The structural brute runs at device speed instead of
+  Python speed. Correct multi-byte (Turkish) handling; a second self-test
+  (`mask_selftest`) requires the GPU's hit set to equal the CPU's over the same
+  candidates before the device is trusted, on top of the raw-AES self-test.
+  The fitted-model tier stays on the CPU.
+
+### Changed
+- CPU sweep chunk size raised (65,536) to cut per-dispatch overhead on
+  many-core machines.
+- The `--dumb-brute` length gate now sizes the "too long" wall against GPU
+  throughput when `--gpu` is active.
+
+### Notes
+- GPU runs from the Python source (`pip install pyopencl numpy` + your GPU's
+  OpenCL runtime). The released binary is CPU-only by design: victims rarely
+  have a GPU or an OpenCL runtime, and bundling it would bloat the binary and
+  raise antivirus false positives. GPU is the operator's cracking path.
+- Developed without a GPU in CI. The kernel AES and the index-to-candidate
+  brute are verified against a reference implementation; the OpenCL execution
+  is validated by the on-device self-tests at run time.
+
 ## 3.5
 
 Recovery, guessing throughput, and file naming.
