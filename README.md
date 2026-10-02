@@ -1,4 +1,7 @@
-You can support my work here: https://ko-fi.com/rho9official
+You can support my work here: 
+https://ko-fi.com/rho9official
+And here: 
+https://throne.com/rho-9-official
 # unmicro
 
 Free decryptor for files encrypted by the **Dev7 / Micro** ransomware family,
