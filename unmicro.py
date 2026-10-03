@@ -73,7 +73,7 @@ USAGE
     Guess harder, takes much longer:
         python3 unmicro.py --in ./encrypted --out ./recovered --brute --deep --workers 4
 
-    Plain structural brute force, 3 chars up over a Turkish+English alphabet,
+    Plain structural brute force, 1 char up over a Turkish+English alphabet,
     resumable:
         python3 unmicro.py --in ./encrypted --out ./recovered --dumb-brute --checkpoint run.ckpt
 
@@ -109,7 +109,7 @@ NOTES
       first. --scavenge FILE tries strings pulled from an unencrypted dump (a
       memory image, pagefile or strings listing), where a typed key often
       survives in the clear. --brute sweeps candidates modelled on this crew's
-      key history. --dumb-brute is a plain structural brute, 3 characters up to
+      key history. --dumb-brute is a plain structural brute, 1 character up to
       the longest recovered key, over the Turkish and English alphabet these
       operators type on; it pauses and asks before a length that would take too
       long. A long sweep holds flat, bounded memory (see --seen-cap) and can be
@@ -1380,9 +1380,9 @@ class KeyModel(object):
         for combo in itertools.product(alpha, repeat=length):
             yield "".join(combo)
 
-    def gen_dumb(self, min_len=3, max_len=None, charset="turkish"):
+    def gen_dumb(self, min_len=1, max_len=None, charset="turkish"):
         """Classic incremental brute force, the dumb counterpart to the fitted
-        model: every string from min_len characters up to the longest recovered
+        model: every string from min_len characters (default 1) up to the longest recovered
         key, over the Turkish+English alphabet, shortest first. No wordlist, no
         motifs. It reaches a key the vocabulary cannot, at brute-force cost, so
         only the short lengths finish in any realistic budget."""
@@ -1479,7 +1479,7 @@ def iter_scavenged(paths, min_len=4, max_len=48):
 
 
 def build_plan(brute=False, deep=False, dumb=False, extra=None, wordlist=None,
-               scavenged=None, dumb_min_len=3, dumb_max_len=None,
+               scavenged=None, dumb_min_len=1, dumb_max_len=None,
                dumb_charset="turkish"):
     """
     Ordered list of (tier name, generator factory), consumed by sweep().
@@ -1487,9 +1487,9 @@ def build_plan(brute=False, deep=False, dumb=False, extra=None, wordlist=None,
     Cheapest and highest-value tiers first: any keys you supplied, your
     wordlist, the 34 recovered keys, then strings scavenged from a dump if you
     gave one. --brute adds the recovered-key variants and the fitted model.
-    --dumb-brute adds one exhaustive tier PER LENGTH, from dumb_min_len up to
-    the longest recovered key, so the caller can pause between lengths before
-    one of them becomes intractable.
+    --dumb-brute adds one exhaustive tier PER LENGTH, from dumb_min_len (1 by
+    default) up to the longest recovered key, so the caller can pause between
+    lengths before one of them becomes intractable.
     """
     plan = []
     if extra:
@@ -2553,7 +2553,7 @@ def main(argv=None):
                        help="give up after this many guesses")
     g_key.add_argument("--dumb-brute", dest="dumb_brute", action="store_true",
                        help="classic incremental brute force: every string from "
-                            "3 characters up to the longest recovered key, over "
+                            "1 character up to the longest recovered key, over "
                             "the Turkish+English alphabet these operators type. "
                             "Follows the structure of the known keys, not a "
                             "dictionary. Exhaustive, so only the short lengths "
