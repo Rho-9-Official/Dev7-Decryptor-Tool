@@ -103,7 +103,7 @@ recover exactly the same files. Pick the one that fits the machine.
 | `unmicro.py` | anything else, including Termux, ARM Linux and macOS | Python 3 |
 
 The two binaries are built by GitHub Actions straight from this repository and
-published on the [Releases](https://github.com/Rho-9-Official/Dev7-decryptor/releases)
+published on the [Releases](https://github.com/Rho-9-Official/Dev7-Decryptor-Tool/releases)
 page. They have a compiled AES back end bundled inside, so they are fast out of
 the box and `--brute` is practical without installing anything.
 
@@ -121,7 +121,7 @@ pulls the binary and the checksum file from this repository, and refuses to
 continue if the checksum does not match.
 
 ```powershell
-$repo = "https://github.com/Rho-9-Official/Dev7-decryptor"
+$repo = "https://github.com/Rho-9-Official/Dev7-Decryptor-Tool"
 $tag  = (curl.exe -fsSLI -o NUL -w "%{url_effective}" "$repo/releases/latest").Split('/')[-1]
 $f    = "unmicro-$($tag.TrimStart('v'))-windows-x86_64.exe"
 curl.exe -fLO "$repo/releases/download/$tag/$f"
@@ -143,7 +143,7 @@ signed, so this is expected. Verify the checksum as above, then choose
 ### Linux (recommended command)
 
 ```bash
-repo=https://github.com/Rho-9-Official/Dev7-decryptor
+repo=https://github.com/Rho-9-Official/Dev7-Decryptor-Tool
 tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest"); tag=${tag##*/}
 f="unmicro-${tag#v}-linux-x86_64"
 curl -fLO "$repo/releases/download/$tag/$f"
@@ -160,15 +160,15 @@ glibc older than 2.35, use the Python source below.
 ### Python source (Termux, ARM, macOS, or if you would rather read the code first)
 
 ```bash
-git clone https://github.com/Rho-9-Official/Dev7-decryptor.git
-cd Dev7-decryptor
+git clone https://github.com/Rho-9-Official/Dev7-Decryptor-Tool.git
+cd Dev7-Decryptor-Tool
 python3 unmicro.py --auto --out ./recovered
 ```
 
 No git? Pull the single file instead:
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/Rho-9-Official/Dev7-decryptor/main/unmicro.py
+curl -fLO https://raw.githubusercontent.com/Rho-9-Official/Dev7-Decryptor-Tool/main/unmicro.py
 python3 unmicro.py --auto --out ./recovered
 ```
 
@@ -180,7 +180,7 @@ Every release binary carries a GitHub build attestation tying it to the exact
 commit and workflow run that produced it. With the GitHub CLI installed:
 
 ```
-gh attestation verify <file> --repo Rho-9-Official/Dev7-decryptor
+gh attestation verify <file> --repo Rho-9-Official/Dev7-Decryptor-Tool
 ```
 
 A pass means the file was built by this repository's own workflow, not
