@@ -1,0 +1,106 @@
+# Build dependencies for the CI binaries, pinned to exact versions with
+# hashes. pip installs these with --require-hashes, so a package that
+# changes on PyPI (a hijacked release, a re-uploaded file) fails the build
+# instead of ending up inside a binary that ships to victims with build
+# attestation attached.
+#
+# This is not requirements.txt. That file is for people running unmicro.py
+# from source and stays loose on purpose.
+#
+# To update, edit the three names below in a scratch file and regenerate:
+#   pip install uv
+#   uv pip compile --universal --python-version 3.12 --generate-hashes \
+#     --no-header --annotation-style line build.in -o requirements-build.txt
+# where build.in lists: pyinstaller, pycryptodome, filetype
+# --universal keeps the Windows-only packages (pefile, pywin32-ctypes) in,
+# otherwise the Windows build fails the hash check.
+
+altgraph==0.17.5 \
+    --hash=sha256:c87b395dd12fabde9c99573a9749d67da8d29ef9de0125c7f536699b4a9bc9e7 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+    # via macholib, pyinstaller
+filetype==1.2.0 \
+    --hash=sha256:66b56cd6474bf41d8c54660347d37afcc3f7d1970648de365c102ef77548aadb \
+    --hash=sha256:7ce71b6880181241cf7ac8697a2f1eb6a8bd9b429f7ad6d27b8db9ba5f1c2d25
+    # via -r /tmp/claude-0/-home-claude/f907512e-b649-5f90-ba86-1b3cf2d02e69/scratchpad/build.in
+macholib==1.16.4 ; sys_platform == 'darwin' \
+    --hash=sha256:da1a3fa8266e30f0ce7e97c6a54eefaae8edd1e5f86f3eb8b95457cae90265ea \
+    --hash=sha256:f408c93ab2e995cd2c46e34fe328b130404be143469e41bc366c807448979362
+    # via pyinstaller
+packaging==26.3 \
+    --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+    # via pyinstaller, pyinstaller-hooks-contrib
+pefile==2024.8.26 ; sys_platform == 'win32' \
+    --hash=sha256:3ff6c5d8b43e8c37bb6e6dd5085658d658a7a0bdcd20b6a07b1fcfc1c4e9d632 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+    # via pyinstaller
+pycryptodome==3.23.0 \
+    --hash=sha256:0011f7f00cdb74879142011f95133274741778abba114ceca229adbf8e62c3e4 \
+    --hash=sha256:11eeeb6917903876f134b56ba11abe95c0b0fd5e3330def218083c7d98bbcb3c \
+    --hash=sha256:14e15c081e912c4b0d75632acd8382dfce45b258667aa3c67caf7a4d4c13f630 \
+    --hash=sha256:156df9667ad9f2ad26255926524e1c136d6664b741547deb0a86a9acf5ea631f \
+    --hash=sha256:187058ab80b3281b1de11c2e6842a357a1f71b42cb1e15bce373f3d238135c27 \
+    --hash=sha256:257bb3572c63ad8ba40b89f6fc9d63a2a628e9f9708d31ee26560925ebe0210a \
+    --hash=sha256:350ebc1eba1da729b35ab7627a833a1a355ee4e852d8ba0447fafe7b14504d56 \
+    --hash=sha256:447700a657182d60338bab09fdb27518f8856aecd80ae4c6bdddb67ff5da44ef \
+    --hash=sha256:45c69ad715ca1a94f778215a11e66b7ff989d792a4d63b68dc586a1da1392ff5 \
+    --hash=sha256:4764e64b269fc83b00f682c47443c2e6e85b18273712b98aa43bcb77f8570477 \
+    --hash=sha256:507dbead45474b62b2bbe318eb1c4c8ee641077532067fec9c1aa82c31f84886 \
+    --hash=sha256:53ecbafc2b55353edcebd64bf5da94a2a2cdf5090a6915bcca6eca6cc452585a \
+    --hash=sha256:573a0b3017e06f2cffd27d92ef22e46aa3be87a2d317a5abf7cc0e84e321bd75 \
+    --hash=sha256:63dad881b99ca653302b2c7191998dd677226222a3f2ea79999aa51ce695f720 \
+    --hash=sha256:64093fc334c1eccfd3933c134c4457c34eaca235eeae49d69449dc4728079339 \
+    --hash=sha256:6501790c5b62a29fcb227bd6b62012181d886a767ce9ed03b303d1f22eb5c625 \
+    --hash=sha256:67bd81fcbe34f43ad9422ee8fd4843c8e7198dd88dd3d40e6de42ee65fbe1490 \
+    --hash=sha256:6fe8258e2039eceb74dfec66b3672552b6b7d2c235b2dfecc05d16b8921649a8 \
+    --hash=sha256:763d1d74f56f031788e5d307029caef067febf890cd1f8bf61183ae142f1a77b \
+    --hash=sha256:7ac1080a8da569bde76c0a104589c4f414b8ba296c0b3738cf39a466a9fb1818 \
+    --hash=sha256:865d83c906b0fc6a59b510deceee656b6bc1c4fa0d82176e2b77e97a420a996a \
+    --hash=sha256:89d4d56153efc4d81defe8b65fd0821ef8b2d5ddf8ed19df31ba2f00872b8002 \
+    --hash=sha256:90460fc9e088ce095f9ee8356722d4f10f86e5be06e2354230a9880b9c549aae \
+    --hash=sha256:93837e379a3e5fd2bb00302a47aee9fdf7940d83595be3915752c74033d17ca7 \
+    --hash=sha256:954af0e2bd7cea83ce72243b14e4fb518b18f0c1649b576d114973e2073b273d \
+    --hash=sha256:9a53a4fe5cb075075d515797d6ce2f56772ea7e6a1e5e4b96cf78a14bac3d265 \
+    --hash=sha256:9a77627a330ab23ca43b48b130e202582e91cc69619947840ea4d2d1be21eb39 \
+    --hash=sha256:a176b79c49af27d7f6c12e4b178b0824626f40a7b9fed08f712291b6d54bf566 \
+    --hash=sha256:a7fc76bf273353dc7e5207d172b83f569540fc9a28d63171061c42e361d22353 \
+    --hash=sha256:aa0698f65e5b570426fc31b8162ed4603b0c2841cbb9088e2b01641e3065915b \
+    --hash=sha256:b34e8e11d97889df57166eda1e1ddd7676da5fcd4d71a0062a760e75060514b4 \
+    --hash=sha256:c75b52aacc6c0c260f204cbdd834f76edc9fb0d8e0da9fbf8352ef58202564e2 \
+    --hash=sha256:c8987bd3307a39bc03df5c8e0e3d8be0c4c3518b7f044b0f4c15d1aa78f52575 \
+    --hash=sha256:ce64e84a962b63a47a592690bdc16a7eaf709d2c2697ababf24a0def566899a6 \
+    --hash=sha256:cfb5cd445280c5b0a4e6187a7ce8de5a07b5f3f897f235caa11f1f435f182843 \
+    --hash=sha256:d8e95564beb8782abfd9e431c974e14563a794a4944c29d6d3b7b5ea042110b4 \
+    --hash=sha256:d97618c9c6684a97ef7637ba43bdf6663a2e2e77efe0f863cce97a76af396446 \
+    --hash=sha256:ddb95b49df036ddd264a0ad246d1be5b672000f12d6961ea2c267083a5e19379 \
+    --hash=sha256:dea827b4d55ee390dc89b2afe5927d4308a8b538ae91d9c6f7a5090f397af1aa \
+    --hash=sha256:e3f2d0aaf8080bda0587d58fc9fe4766e012441e2eed4269a77de6aea981c8be \
+    --hash=sha256:eb8f24adb74984aa0e5d07a2368ad95276cf38051fe2dc6605cbcf482e04f2a7
+    # via -r /tmp/claude-0/-home-claude/f907512e-b649-5f90-ba86-1b3cf2d02e69/scratchpad/build.in
+pyinstaller==6.22.3 \
+    --hash=sha256:020d4fe0627f5c73dfbcfad1a6578ef354d5fe4bdccd9d8e5a615528f5a45d2b \
+    --hash=sha256:052f4a1cd4f81092ccb7a18fe8ebc9ecf832a5917317e39fb3775af4e959b253 \
+    --hash=sha256:05eb2f5615503e72939a7224d68b4aff572c6b0438ee4a17d0a4b481f399362d \
+    --hash=sha256:312da84b4b31ab9750066a823734c11b7c68757fdd67c9f038bf19c330a954e4 \
+    --hash=sha256:31df3cc4261e804a53d358b7897c293ec8b88b167a7cca06c78018085c855f97 \
+    --hash=sha256:451a4ae14b719365bf1a2f0a99dae7b3463060061c3a394c70d5264cfb439528 \
+    --hash=sha256:46a3e30a118341a1ec20667a5a95aa7e0aa8c4fa129893c0151b3eb3f801a722 \
+    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b \
+    --hash=sha256:9e4f7bd64b2103f14b4a6240fb9155e9fe7bc61391b4043bbddb7d3ebc8ab0fa \
+    --hash=sha256:a2b6fc26601e8c2596c3d54981566934a3382e85d05d0fe91b55b6a8dcc6b282 \
+    --hash=sha256:ea240b5dfa831ff673c97505eee0ec24670bccf71396c83109440348944c83d0 \
+    --hash=sha256:f82d0fb89f21c3ed6f482ee16f341bc59e8a31dbabb9bae9ef04e53ade4dc0d9
+    # via -r /tmp/claude-0/-home-claude/f907512e-b649-5f90-ba86-1b3cf2d02e69/scratchpad/build.in
+pyinstaller-hooks-contrib==2026.8 \
+    --hash=sha256:4d825786ad7a9b7dbcc52d612748a34562fe273461bcfd88f4d549c594bbf8f9 \
+    --hash=sha256:6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084
+    # via pyinstaller
+pywin32-ctypes==0.2.3 ; sys_platform == 'win32' \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8 \
+    --hash=sha256:d162dc04946d704503b2edc4d55f3dba5c1d539ead017afa00142c38b9885755
+    # via pyinstaller
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
+    --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
+    # via pyinstaller
