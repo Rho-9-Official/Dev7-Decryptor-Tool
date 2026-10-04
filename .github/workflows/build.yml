@@ -228,6 +228,12 @@ jobs:
           ./unmicro-linux-x86_64 --auto --out recovered
           ```
 
+          From 3.7 on, each build needs its own license key. Pass it with
+          `--license KEY`, set `UNMICRO_LICENSE`, or enter it when prompted.
+          If you do not have a key for this build, email **recon@rho-9.com**
+          and mention "Chattering Magpies". Rho-9 sends one back once your
+          case is confirmed. Keys from earlier builds will not work here.
+
           Your encrypted files are never modified, renamed or deleted.
           Keep them until you have opened the recovered copies and are
           satisfied. Do not pay, and do not wipe the machine.
