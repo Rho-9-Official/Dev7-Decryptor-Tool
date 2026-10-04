@@ -9,10 +9,16 @@
 # --brute being a real option and being a theoretical one.
 #
 # Triggers
-#   push to main     build + smoke test, artifacts kept 30 days
+#   push to main     build + smoke test, artifacts kept 30 days, and if
+#                    VERSION in unmicro.py has no v<VERSION> tag yet, the
+#                    release job creates that tag on this commit and
+#                    publishes the GitHub Release. Bumping VERSION and
+#                    merging is the whole release process.
 #   pull request     build + smoke test only
-#   tag v*           build + smoke test + published GitHub Release
-#   manual           Actions tab -> Build binaries -> Run workflow
+#   tag v*           build + smoke test + published GitHub Release (still
+#                    works if a tag is pushed by hand)
+#   manual           Actions tab -> Build binaries -> Run workflow (build
+#                    only, never releases)
 #
 # Supply chain: no third-party actions. Only actions/* and the gh CLI that is
 # preinstalled on the runners, and every action is pinned to a commit SHA
@@ -167,11 +173,13 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event_name == 'push' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-22.04
     permissions:
-      contents: write     # create the release
+      contents: write     # create the tag and the release
       actions: read       # download this run's artifacts
       id-token: write     # build provenance
       attestations: write # build provenance
@@ -179,9 +187,47 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # Works out which tag this run releases, or decides there is nothing
+      # to release.
+      #   tag push:  the pushed tag, always released.
+      #   main push: v<VERSION> from unmicro.py, released only if that tag
+      #              does not exist yet. If it exists, that version already
+      #              went out (or a hand-pushed tag run owns it), so this
+      #              run stops after the build and does not touch it.
+      # The tag created here comes from GITHUB_TOKEN, which GitHub does not
+      # let start another workflow run, so there is no second, duplicate
+      # release run off the back of it.
+      - name: Decide release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "tag push, releasing ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          v=$(python3 - <<'PY'
+          import io, re
+          src = io.open("unmicro.py", encoding="utf-8").read()
+          print(re.search(r'^VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', src, re.M).group(1))
+          PY
+          )
+          tag="v${v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "${tag} already exists, nothing to release"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "${tag} does not exist yet, releasing it from ${GITHUB_SHA}"
+          fi
+
       # gh run download rather than actions/download-artifact, so the upload
       # and download halves can never drift onto incompatible major versions.
       - name: Collect binaries from this run
+        if: steps.tag.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -192,6 +238,7 @@ jobs:
           ls -l dist
 
       - name: Checksums
+        if: steps.tag.outputs.release == 'true'
         run: |
           set -euo pipefail
           cd dist
@@ -201,13 +248,19 @@ jobs:
       # Lets anyone confirm the binary came out of this repo and this commit,
       # which matters when the ask is "download this exe and run it as admin".
       - name: Attest build provenance
+        if: steps.tag.outputs.release == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/unmicro-*
 
+      # --target only matters on a main push, where the tag does not exist
+      # yet and gh creates it on this exact commit. On a tag push the tag
+      # already exists and --target is ignored.
       - name: Publish
+        if: steps.tag.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           cat > notes.md <<'EOF'
@@ -257,6 +310,7 @@ jobs:
             echo "Rho-9 Systems. Your first line of unusual defense."
           } >> notes.md
 
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --title "unmicro ${GITHUB_REF_NAME}" \
+          gh release create "${TAG}" dist/* \
+            --target "${GITHUB_SHA}" \
+            --title "unmicro ${TAG}" \
             --notes-file notes.md
