@@ -2,6 +2,54 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.7
+
+Per-build license key, so the recovered-key list stops riding in the public
+binary.
+
+### Added
+- **Per-build license key.** The recovered-key list, operator handles, Turkish
+  vocabulary, keyboard layouts and actor notes are sealed with AES-256-CBC +
+  HMAC-SHA256 under a license key that is distinct for each release. The tool
+  reads the key from `--license KEY`, from the `UNMICRO_LICENSE` environment
+  variable, or from an interactive prompt. If you do not have a key for your
+  build, contact **recon@rho-9.com** and mention "Chattering Magpies"; Rho-9
+  sends one back once your case is confirmed.
+- **`--self-test`.** Confirms the sealed blobs survived PyInstaller
+  (SHA-256 over the ciphertext bytes), confirms the AES back end can decrypt a
+  known vector, and cross-checks the back end against the built in pure-Python
+  AES on a random block. Does not require a license. This is the CI smoke
+  test.
+- **`--list-keys`.** Prints the recovered operator keys this build knows
+  about. Requires the license, so a copy of the binary alone cannot be grepped
+  for them.
+
+### Changed
+- Pure-Python AES-256 is now reused for the sealed-blob unseal as well
+  (CBC built on the existing ECB primitive), so the tool runs on a bare
+  interpreter end to end, with no new dependencies and no encrypt path. The
+  "unmicro cannot produce a .cryptedmicro file" invariant is unchanged.
+- CI smoke test switched from `--list-keys` (which never shipped) to
+  `--self-test`, so building this repo does not need the license secret.
+
+### Why
+The Chattering Magpies rotate their key choices once Rho-9 publishes new
+recovered ones, which stops this tool from opening the next round of victims'
+files. Taking the key list out of the public binary keeps the gang reading
+only what Rho-9 chooses to publish on its own channels, not what is sitting
+ready to grep inside this tool. The license key is rotated at every release;
+victims who already have a key for a previous build get the new one with
+their case, same channel.
+
+### Notes
+- Key is per build. Rebuilding the tool against a new license is an offline
+  step at Rho-9; the shipped tool itself still has no encrypt path.
+- A wrong license fails the HMAC verify in constant time and refuses to
+  unseal; nothing is partially decrypted and no cleartext is cached.
+- The licensing is a social-engineering friction layer, not a cryptographic
+  secret-sharing scheme: anyone who gets a key can read the tables that build
+  exposes. Rotation is how we handle that.
+
 ## 3.6
 
 GPU throughput for the structural brute.
@@ -10,7 +58,7 @@ GPU throughput for the structural brute.
 - **On-device structural brute for `--gpu`.** The bottleneck for GPU
   acceleration was feeding it: one Python thread produces only a few hundred
   thousand candidates a second. Now, for `--dumb-brute`, the GPU generates the
-  candidates itself — each work item turns its index into a candidate over the
+  candidates itself, each work item turns its index into a candidate over the
   alphabet, builds the key, decrypts, and checks the magic table in-kernel,
   writing back only hits. The structural brute runs at device speed instead of
   Python speed. Correct multi-byte (Turkish) handling; a second self-test

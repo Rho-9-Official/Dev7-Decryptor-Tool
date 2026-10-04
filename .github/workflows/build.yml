@@ -86,7 +86,7 @@ jobs:
           v=$(python - <<'PY'
           import io, re
           src = io.open("unmicro.py", encoding="utf-8").read()
-          print(re.search(r'^VERSION\s*=\s*"([^"]+)"', src, re.M).group(1))
+          print(re.search(r'^VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', src, re.M).group(1))
           PY
           )
           echo "version=$v" >> "$GITHUB_OUTPUT"
@@ -110,6 +110,13 @@ jobs:
 
       - name: Smoke test the binary
         shell: bash
+        # The smoke test never has the real license key. Every check here
+        # runs against things that are available without unlocking the
+        # sealed blobs. --self-test reports all three at once: the
+        # sealed-blob integrity digest (SHA-256 over the ciphertext
+        # bytes), the AES back end check (compiled lib + pure-python
+        # agreement on a random vector) and the bundled filetype
+        # detector. Fail the build if any of those regressed.
         run: |
           set -euo pipefail
           BIN="dist/${{ matrix.binary }}"
@@ -118,24 +125,22 @@ jobs:
           echo "--- version ---"
           "$BIN" --version
 
-          echo "--- recovered operator keys survived the freeze ---"
-          "$BIN" --list-keys | grep -qx "zarox"
+          echo "--- self-test ---"
+          out=$("$BIN" --self-test)
+          echo "$out"
+          echo "$out" | grep -qx "self-test passed"
 
           echo "--- a compiled AES backend is bundled ---"
-          # pure-python here would mean --brute ships unusably slow, so this
-          # is a hard failure, not a warning.
-          mkdir -p smoke/empty
-          banner=$("$BIN" --in smoke/empty --identify 2>&1 || true)
-          echo "$banner"
-          echo "$banner" | grep -Eq "AES back end: (pycryptodome|cryptography)"
+          # pure-python here would mean --brute ships unusably slow, so
+          # this is a hard failure, not a warning.
+          echo "$out" | grep -Eq "AES back end: (pycryptodome|cryptography)"
 
           echo "--- the filetype detector is bundled for extension repair ---"
-          # A missing filetype would silently fall back to the built-in table.
-          # The banner names the active detector on any non --identify run, so
-          # this fails the build if filetype did not make it into the binary.
-          det=$("$BIN" --in smoke/empty --out smoke/out 2>&1 || true)
-          echo "$det"
-          echo "$det" | grep -Eq "Type detection: filetype "
+          # A missing filetype would silently fall back to the built-in
+          # table on a real run. --self-test prints the detector it
+          # found so the build fails here if filetype did not make it
+          # into the binary.
+          echo "$out" | grep -Eq "Type detection: filetype "
 
           echo "smoke test passed"
 

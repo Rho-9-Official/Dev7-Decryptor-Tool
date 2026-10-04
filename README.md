@@ -47,6 +47,50 @@ triaged quickly.
 
 ---
 
+## About the license key
+
+Starting with 3.7, every build of unmicro is sealed with a **per-build license
+key**. The recovered-key list and the rest of the operator intelligence this
+tool uses are encrypted inside the binary and are only unlocked once you
+supply that key.
+
+**Why.** The Chattering Magpies have shown they will rotate their key choices
+once Rho-9 publishes new recovered ones, which stops this tool from opening
+the next round of victims' files. Taking the key list out of the public
+binary keeps the gang reading only what Rho-9 chooses to publish on its own
+channels, not what is sitting ready to grep inside this file. The key is
+rotated at every release.
+
+**Getting a key.** If you are a victim of this crew, email
+**recon@rho-9.com** with the phrase **Chattering Magpies** and anything about
+where you were hit. Rho-9 sends a key back once your case is confirmed. There
+is no charge for the key. If you already have a key from a previous build, we
+will send you the new one with any update to your case, same channel.
+
+**Supplying the key.** Three ways, pick whichever fits:
+
+```
+# at the command line
+unmicro.py --license YOUR-LICENSE-KEY --auto --out recovered
+
+# or as an environment variable, nice for long sessions
+export UNMICRO_LICENSE=YOUR-LICENSE-KEY
+unmicro.py --auto --out recovered
+
+# or just run it and it will prompt
+unmicro.py --auto --out recovered
+License key:
+```
+
+The prompt uses hidden input (like a password prompt), so the key does not
+land in your terminal scrollback.
+
+A wrong key does not partially unseal anything; the HMAC verify fails in
+constant time and the tool stops with a note telling you how to reach Rho-9.
+`--version`, `--self-test` and `--gpu-info` all run without a key.
+
+---
+
 ## Getting the tool
 
 There are three ways to run unmicro. They take exactly the same options and
@@ -172,7 +216,12 @@ python3 unmicro.py --in ./encrypted --out ./recovered --brute
 python3 unmicro.py --in ./encrypted --out ./recovered --brute --deep --workers 4
 ```
 
-Run any build with `--version` to see which release you have.
+All of the above will prompt for the license key the first time, or pick it
+up from `--license` or `$UNMICRO_LICENSE`. See **About the license key**
+above.
+
+Run any build with `--version` to see which release you have, and
+`--self-test` to confirm it unpacked intact (both run without a license).
 
 ## Requirements
 
@@ -254,8 +303,10 @@ On by default. Pass `--no-fix-ext` to turn it off and keep the original names.
 * Nothing is overwritten. A name collision gets a numeric suffix unless you
   pass `--overwrite`.
 * **This tool only decrypts.** There is no encrypt path in it anywhere. The
-  AES back ends expose decryption only and the built in AES has no
-  `encrypt_block`. It cannot produce a `.cryptedmicro` file.
+  AES back ends expose decryption only, the built in AES has no
+  `encrypt_block`, and the sealed-blob unseal is HMAC-verified AES-CBC
+  decrypt built on the same primitive. It cannot produce a `.cryptedmicro`
+  file.
 
 ---
 
@@ -319,18 +370,17 @@ AES-256 itself is **not** broken here and is not being attacked. The key is a
 string a person typed. It is not derived from anything in the file and cannot
 be read out of the ciphertext.
 
-The candidate generator is fitted from the 34 keys recovered from the
-operators' own Discord C2. Nothing in it is hand ranked. The character
-alphabets, the length prior, the affix widths, the tiling motifs and the share
-of the sweep each family receives are all measured from those keys. The
-families are:
+The candidate generator is fitted from the recovered keys handed over to this
+build. Nothing in it is hand ranked. The character alphabets, the length
+prior, the affix widths, the tiling motifs and the share of the sweep each
+family receives are all measured from those keys. The families are:
 
 | family | share | what it covers |
 | --- | --- | --- |
-| digit | 32.4% | tilings and rotations of a short motif over the observed digit alphabet, plus fumbled tilings |
-| word | 26.5% | Turkish and English words with folding and short affixes |
-| motor | 23.5% | keyboard runs, reversals and zigzags on the Turkish Q layout |
-| stem | 17.6% | operator handle or word plus a digit tail |
+| digit | ~32% | tilings and rotations of a short motif over the observed digit alphabet, plus fumbled tilings |
+| word | ~27% | Turkish and English words with folding and short affixes |
+| motor | ~24% | keyboard runs, reversals and zigzags on the Turkish Q layout |
+| stem | ~18% | operator handle or word plus a digit tail |
 
 Two things the fit ruled out, recorded here so nobody rebuilds them:
 
@@ -339,8 +389,9 @@ Two things the fit ruled out, recorded here so nobody rebuilds them:
   are 5.1e11 to 8.2e16. Observed key length runs 5 to 23 with a mean of 11, so
   the tractable short masks are exactly the ones these operators do not use.
 * A **character bigram** suffers the degenerate repeat pathology. Its highest
-  scoring strings are `1111111111111111` and `KKKKKKKK`, and fitted on all 34
-  keys it surfaced only 8 of them in the first million candidates.
+  scoring strings are `1111111111111111` and `KKKKKKKK`, and fitted on all
+  recovered keys it surfaced only a few of them in the first million
+  candidates.
 
 ---
 
@@ -350,11 +401,10 @@ Measured by leave one out: refit the model without each recovered key in turn,
 then find where that key lands in the stream it would actually be swept in. A
 model scored against keys it was fitted on is scoring its own memory.
 
-Result: **14 of 34** within a 2,000,000 candidate budget, at roughly 1.3M
-candidates per second generated.
-
-The measurement harness is deliberately not shipped in the tool. Nothing in
-`unmicro.py` exists except to recover files.
+Result on the 3.6 corpus: **14 of 34** within a 2,000,000 candidate budget, at
+roughly 1.3M candidates per second generated. The 3.7 build adds further
+recovered keys; the measurement harness is deliberately not shipped in the
+tool. Nothing in `unmicro.py` exists except to recover files.
 
 ### Known gaps
 
@@ -368,8 +418,8 @@ These are real and are not regressions:
   budget from the families that work.
 * **Vocabulary.** A key built on a name the vocabulary does not contain is
   unreachable no matter how candidates are ordered. Coverage of the stem and
-  word families is vocabulary, not structure. Adding names to `TURKISH_VOCAB`
-  is the cheapest way to improve this tool.
+  word families is vocabulary, not structure. Adding names to the sealed
+  Turkish vocabulary is the cheapest way to improve this tool.
 * `keyu3131` is missed. The honest route to it is stem mutation, not a
   hardcoded prefix copied out of the key itself.
 
@@ -377,6 +427,17 @@ These are real and are not regressions:
 
 ## What's new
 
+- **Per-build license key (3.7).** The recovered-key list, operator handles,
+  Turkish vocabulary, keyboard layouts and actor notes are sealed with
+  AES-256-CBC + HMAC-SHA256 under a key that is rotated at every release, so
+  the gang cannot grep the public binary for them and rotate around what Rho-9
+  has recovered. Supplied via `--license`, `UNMICRO_LICENSE`, or an
+  interactive prompt. Victims get a key from **recon@rho-9.com**, free of
+  charge.
+- **`--self-test` (3.7).** Confirms the sealed blobs survived the freeze and
+  the AES back end is intact. No license needed. This is what CI runs.
+- **`--list-keys` (3.7).** Prints the recovered operator keys this build
+  knows about. Requires the license.
 - **Extension repair.** Recovered files are written under their true extension.
   This crew randomises extensions before encrypting (a video named `.jpg`), so
   unmicro reads the decrypted bytes and corrects a genuinely mismatched
@@ -405,7 +466,7 @@ These are real and are not regressions:
 The sweep is one AES-256 decrypt per candidate, which is exactly what a GPU is
 good at. The catch is feeding it: a single Python thread can only produce a few
 hundred thousand candidates a second, which would starve any GPU. So for the
-structural brute (`--dumb-brute`), **the GPU generates the candidates itself** —
+structural brute (`--dumb-brute`), **the GPU generates the candidates itself**,
 each work item turns its own index into a candidate, builds the key, decrypts,
 and checks the result. Nothing but the rare hit crosses the bus, so it runs at
 the card's speed. One OpenCL kernel covers both NVIDIA and AMD.
@@ -448,6 +509,9 @@ report the device.
 | flag | effect |
 | --- | --- |
 | (no options) | search every drive, try every route, write to `./unmicro-recovered` |
+| `--license KEY` | this build's license key. Also read from `UNMICRO_LICENSE`, else prompted |
+| `--self-test` | sealed-blob integrity + AES back end check. Does not need a license |
+| `--list-keys` | print the recovered operator keys this build knows about. Needs a license |
 | `--auto` | search every drive and user location for encrypted files |
 | `--brute` | sweep generated candidates when the recovered keys do not fit |
 | `--deep` | widen every family, including the layout walker. Hours, not seconds |
@@ -466,7 +530,6 @@ report the device.
 | `--no-fix-ext` | stop correcting swapped extensions (this crew randomises them, so the correction is on by default) |
 | `--strict` | never write anything that failed structural verification |
 | `--force` | apply a single supplied key without header checking |
-| `--list-keys` | print the recovered keys and exit |
 
 ---
 
@@ -485,8 +548,9 @@ packs, and through files posing as games.
 
 ## Getting help
 
-Reply or DM wherever you saw the Rho-9 post about this. Include the phrase
-Chattering Magpies so the case is routed quickly.
+Reply or DM wherever you saw the Rho-9 post about this, or email
+**recon@rho-9.com**. Include the phrase Chattering Magpies so the case is
+routed quickly.
 
 If this tool recovered your files, that is the end of it and you owe nobody
 anything. If it did not, keep the encrypted copies and get in touch. There may
