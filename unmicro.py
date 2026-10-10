@@ -119,21 +119,26 @@ def plain_path(path):
 
 _SEALED_BLOBS = {
     'K': {
-        'iv': 'UcBKjgwaMq7HcoLXpmsw4A==',
+        'iv': 'h+FQocpNyLIHVYkt69bOyw==',
         'ct': (
-            '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'
+            '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'
+            'fy37'
         ),
-        'tag': 'OqtfHBsTRlN3vAIe4YAokF65HUfMmdqHPkg8Bx8KFfA=',
+        'tag': '5f0DZwcWxCZW5h+/atuBMyq88v3jWdghGjnBAFRLyyo=',
     },
     'H': {
         'iv': 'XDevjCSBj3FS7ni7X2ib4A==',
@@ -280,7 +285,7 @@ _SEALED_BLOBS = {
         'tag': 'TXIoqGPdLU0pFweWy5noZ0FDXtdL+Q9TarsDItTYvw0=',
     },
 }
-_SEALED_INTEGRITY = 'a89c3e60193be0ff51b80b7652815100c2e63c9ec9d5a0298dfa61548a893cf4'
+_SEALED_INTEGRITY = '6381a3a98b465aa459cfa0f8e17d6b90d552c0e37a3df8dd5855e9db0e8a7e4c'
 
 # These start as None and are populated by _unlock() once the license key
 # has been supplied. Any code that touches them before unlock sees None,
@@ -2527,6 +2532,16 @@ def main(argv=None):
             emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key)
             tried += etried
             merge(emap, 'ecb')
+            # The same typed key can be reused across both builds, so a key
+            # the ECB search found is tried on every GCM file still closed.
+            covered_now = set()
+            for hits in mapping.values():
+                covered_now.update(hits)
+            closed_gcm = [f for f in files if gcm_shaped(sizes[f]) and f not in covered_now]
+            if emap and closed_gcm:
+                if not args.quiet:
+                    print('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
+                merge(map_gcm_keys_to_files(closed_gcm, list(emap), workers=workers, quiet=args.quiet), 'gcm')
             leftover = [f for f in eun if gcm_shaped(sizes[f]) and f not in file_scheme]
             if leftover and (budget_left() is None or budget_left() > 0):
                 if not args.quiet:

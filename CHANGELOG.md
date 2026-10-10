@@ -19,7 +19,9 @@ AES-ECB one.
   length cannot be ECB go to the GCM search; block-aligned files go through
   the ECB search, and those it cannot open, or that a GCM key from the same
   machine opens, are treated as GCM. One machine with both formats, or
-  several keys of each, is handled in one run.
+  several keys of each, is handled in one run. A key found on either format
+  is also tried on the other, since the same typed key can be reused across
+  builds.
 - **GCM key search.** Supplied keys, wordlist, recovered operator keys,
   scavenged strings and (with `--brute`) recovered key variants, across all
   worker processes. A hit is a tag match, so there are no false positives.
@@ -29,6 +31,9 @@ AES-ECB one.
   AES-256-GCM against NIST test case 15 on both the active back end and the
   pure-Python one, and confirms a corrupted tag is rejected. Still no license
   needed.
+
+- **Sealed recovered-key table updated** with newly recovered operator keys.
+  Same license as 3.7; the table is still only readable with it.
 
 ### Unchanged
 - The original AES-ECB path: decryption, key search, GPU brute, checkpoints
