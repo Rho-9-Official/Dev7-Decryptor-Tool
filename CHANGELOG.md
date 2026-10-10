@@ -19,7 +19,9 @@ AES-ECB one.
   length cannot be ECB go to the GCM search; block-aligned files go through
   the ECB search, and those it cannot open, or that a GCM key from the same
   machine opens, are treated as GCM. One machine with both formats, or
-  several keys of each, is handled in one run.
+  several keys of each, is handled in one run. A key found on either format
+  is also tried on the other, since the same typed key can be reused across
+  builds.
 - **GCM key search.** Supplied keys, wordlist, recovered operator keys,
   scavenged strings and (with `--brute`) recovered key variants, across all
   worker processes. A hit is a tag match, so there are no false positives.

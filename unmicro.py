@@ -2527,6 +2527,16 @@ def main(argv=None):
             emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key)
             tried += etried
             merge(emap, 'ecb')
+            # The same typed key can be reused across both builds, so a key
+            # the ECB search found is tried on every GCM file still closed.
+            covered_now = set()
+            for hits in mapping.values():
+                covered_now.update(hits)
+            closed_gcm = [f for f in files if gcm_shaped(sizes[f]) and f not in covered_now]
+            if emap and closed_gcm:
+                if not args.quiet:
+                    print('  trying the ECB key(s) on %d still-closed file(s) as AES-GCM' % len(closed_gcm))
+                merge(map_gcm_keys_to_files(closed_gcm, list(emap), workers=workers, quiet=args.quiet), 'gcm')
             leftover = [f for f in eun if gcm_shaped(sizes[f]) and f not in file_scheme]
             if leftover and (budget_left() is None or budget_left() > 0):
                 if not args.quiet:
