@@ -303,10 +303,12 @@ On by default. Pass `--no-fix-ext` to turn it off and keep the original names.
 * Nothing is overwritten. A name collision gets a numeric suffix unless you
   pass `--overwrite`.
 * **This tool only decrypts.** There is no encrypt path in it anywhere. The
-  AES back ends expose decryption only, the built in AES has no
-  `encrypt_block`, and the sealed-blob unseal is HMAC-verified AES-CBC
-  decrypt built on the same primitive. It cannot produce a `.cryptedmicro`
-  file.
+  AES back ends are used for decryption only, and the sealed-blob unseal is
+  HMAC-verified AES-CBC decrypt built on the same primitive. The built in AES
+  has a forward block function for one reason: GCM decryption runs AES in
+  counter mode, which uses the forward direction to make keystream. Nothing in
+  the tool computes a tag or writes ciphertext. It cannot produce a
+  `.cryptedmicro` file.
 
 ---
 
@@ -323,6 +325,11 @@ structure of the file before it counts:
 * plain text is validated by decoding as UTF-8 with a printable character
   ratio, which is safe because a wrong key yields uniformly random bytes and
   random bytes of any real length are valid UTF-8 with vanishing probability
+
+For the newer AES-GCM files (see below) none of that is needed: the 128-bit
+authentication tag either matches or it does not, and a match proves the key
+and every byte of the file. Those lines are marked `[GCM, tag verified]`, and
+a GCM file is never written unless its tag matched.
 
 Three outcomes appear in the output:
 
@@ -351,6 +358,12 @@ tool alone.
 ---
 
 ## How the key search works
+
+There are two file formats under the same `.cryptedmicro` extension, and one
+machine can hold both. unmicro handles both in the same run and works out the
+format per file.
+
+### The original format (AES-ECB)
 
 The malware derives its AES key with no KDF, no IV, no salt and no per file
 state:
@@ -393,6 +406,32 @@ Two things the fit ruled out, recorded here so nobody rebuilds them:
   recovered keys it surfaced only a few of them in the first million
   candidates.
 
+### The newer format (AES-GCM)
+
+Newer builds of the `!micro` command do it properly:
+
+```
+salt       = 16 random bytes per file
+iv         = 12 random bytes per file
+key        = PBKDF2-HMAC-SHA256(keyString as UTF-8, salt, 600000 rounds, 32 bytes)
+cipher     = AES/GCM/NoPadding, 128-bit tag
+file       = salt | iv | ciphertext | tag
+```
+
+The typed key is still the only secret, so the recovered keys still work.
+What changes is the cost of a guess: 600,000 PBKDF2 rounds per file, roughly
+0.2 seconds per CPU core, instead of one AES block. So on GCM files unmicro
+tries the supplied keys, wordlist, recovered operator keys, scavenged strings
+and (under `--brute`) the recovered key variants, and leaves the fitted model
+and the structural brute to the older files, where they finish in a sensible
+time. The GPU path is not used for GCM.
+
+Telling the formats apart: a GCM file is the original length plus 44 bytes, so
+it is a whole number of AES blocks only one time in sixteen, while an ECB file
+always is. Files that cannot be ECB go straight to the GCM search. Block
+aligned files go through the ECB search, and any of those it cannot open, or
+that a GCM key from the same machine opens, are treated as GCM.
+
 ---
 
 ## How well it works
@@ -427,6 +466,11 @@ These are real and are not regressions:
 
 ## What's new
 
+- **AES-GCM files (3.8).** Newer builds of the malware encrypt with
+  AES-256-GCM under a PBKDF2-SHA256 key, still to `.cryptedmicro`. unmicro now
+  recovers both formats in one run, works out which one each file is, and
+  verifies GCM files by their authentication tag. Nothing changes for the
+  original ECB files. See "How the key search works".
 - **Per-build license key (3.7).** The recovered-key list, operator handles,
   Turkish vocabulary, keyboard layouts and actor notes are sealed with
   AES-256-CBC + HMAC-SHA256 under a key that is rotated at every release, so

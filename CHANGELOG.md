@@ -2,6 +2,48 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.8
+
+Recovers the newer AES-GCM `.cryptedmicro` format alongside the original
+AES-ECB one.
+
+### Added
+- **AES-256-GCM decryption.** Newer `!micro` builds write
+  `salt(16) | iv(12) | ciphertext | tag(16)`, keyed by
+  PBKDF2-HMAC-SHA256 over the typed key (UTF-8), 600,000 rounds, 256 bits.
+  Works on every back end: `cryptography`, `pycryptodome`, and the built in
+  pure-Python AES (with its own GHASH), so a bare interpreter still runs it.
+  Large files are streamed in 1 MiB chunks, and no plaintext leaves the GCM
+  path until the tag has verified.
+- **Per-file format detection.** Both formats share the extension. Files whose
+  length cannot be ECB go to the GCM search; block-aligned files go through
+  the ECB search, and those it cannot open, or that a GCM key from the same
+  machine opens, are treated as GCM. One machine with both formats, or
+  several keys of each, is handled in one run.
+- **GCM key search.** Supplied keys, wordlist, recovered operator keys,
+  scavenged strings and (with `--brute`) recovered key variants, across all
+  worker processes. A hit is a tag match, so there are no false positives.
+  Each found key is then mapped across the remaining files in parallel, and
+  the derived keys are cached so the write pass does not run PBKDF2 again.
+- **Self-test** now checks PBKDF2-HMAC-SHA256 against the RFC 7914 vector and
+  AES-256-GCM against NIST test case 15 on both the active back end and the
+  pure-Python one, and confirms a corrupted tag is rejected. Still no license
+  needed.
+
+### Unchanged
+- The original AES-ECB path: decryption, key search, GPU brute, checkpoints
+  and verification behave exactly as in 3.7. ECB-only machines see no
+  difference except that files which cannot be ECB are no longer swept as ECB.
+
+### Notes
+- The fitted model, structural brute and GPU are not run against GCM files.
+  At 600,000 PBKDF2 rounds a guess costs roughly 0.2 seconds per core, so an
+  open-ended search there is not practical. `--checkpoint` covers the ECB
+  search only; the GCM tiers are bounded.
+- The built in AES gained a forward block function, used only as GCM's
+  counter-mode keystream. The tool still has no code that computes a tag or
+  writes ciphertext, so it still cannot produce a `.cryptedmicro` file.
+
 ## 3.7
 
 Per-build license key, so the recovered-key list stops riding in the public
