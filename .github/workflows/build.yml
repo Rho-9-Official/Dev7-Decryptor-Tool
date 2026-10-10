@@ -150,6 +150,12 @@ jobs:
           # this is a hard failure, not a warning.
           echo "$out" | grep -Eq "AES back end: (pycryptodome|cryptography)"
 
+          echo "--- the AES-GCM path (newer .cryptedmicro format) works ---"
+          # PBKDF2 and GCM known-answer vectors on the bundled back end and
+          # on the built-in one, including a corrupted tag being rejected.
+          echo "$out" | grep -q "PBKDF2-SHA256 vector: OK"
+          echo "$out" | grep -q "AES-GCM vector: OK"
+
           echo "--- the filetype detector is bundled for extension repair ---"
           # A missing filetype would silently fall back to the built-in
           # table on a real run. --self-test prints the detector it

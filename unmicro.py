@@ -25,9 +25,24 @@ except Exception:
     _filetype = None
     HAVE_FILETYPE = False
     FILETYPE_VERSION = None
-VERSION = '3.7'
+VERSION = '3.8'
 EXT = '.cryptedmicro'
 WINDOWS = os.name == 'nt'
+# Newer !micro builds (AES-256-GCM). Same .cryptedmicro extension, so the
+# format is told apart per file: salt(16) | iv(12) | ciphertext | tag(16),
+# key = PBKDF2-HMAC-SHA256(typed key as UTF-8, salt, 600000, 32 bytes).
+GCM_SALT_LEN = 16
+GCM_IV_LEN = 12
+GCM_TAG_LEN = 16
+GCM_OVERHEAD = GCM_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN
+GCM_MIN_LEN = GCM_OVERHEAD
+GCM_KDF_ITERS = 600000
+GCM_KDF_CACHE_CAP = 200000
+GCM_READ_CHUNK = 1 << 20
+# Key-search tiers that are run against GCM files. Every guess costs a full
+# 600,000-round PBKDF2 there, so the open-ended generators (fitted model,
+# structural brute) are left to the ECB files.
+GCM_TIERS = ('supplied keys', 'wordlist', 'recovered operator keys', 'scavenged strings', 'recovered key variants')
 SEEN_CAP = 1000000
 DEFAULT_OUT_DIR = 'unmicro-recovered'
 ENGLISH_LOWER = 'abcdefghijklmnopqrstuvwxyz'
@@ -283,14 +298,43 @@ UNFOLD_MAP = {'s': 'ş', 'S': 'Ş', 'i': 'ı', 'I': 'İ', 'g': 'ğ', 'G': 'Ğ', 
 SIGNATURES = [(0, b'\x89PNG\r\n\x1a\n', 'PNG', '.png'), (0, b'\xff\xd8\xff', 'JPEG', '.jpg'), (0, b'GIF87a', 'GIF', '.gif'), (0, b'GIF89a', 'GIF', '.gif'), (0, b'BM', 'BMP', '.bmp'), (0, b'RIFF', 'RIFF (WEBP/WAV/AVI)', None), (0, b'%PDF-', 'PDF', '.pdf'), (0, b'PK\x03\x04', 'ZIP/OOXML/JAR', None), (0, b'PK\x05\x06', 'ZIP (empty)', '.zip'), (0, b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1', 'OLE2 (legacy Office)', None), (0, b'\x1f\x8b', 'GZIP', '.gz'), (0, b"7z\xbc\xaf'\x1c", '7-Zip', '.7z'), (0, b'Rar!\x1a\x07', 'RAR', '.rar'), (0, b'fLaC', 'FLAC', '.flac'), (0, b'ID3', 'MP3', '.mp3'), (0, b'\xff\xfb', 'MP3', '.mp3'), (0, b'OggS', 'OGG', '.ogg'), (0, b'\x1aE\xdf\xa3', 'Matroska/WEBM', '.mkv'), (0, b'MZ', 'PE executable', '.exe'), (0, b'\x7fELF', 'ELF executable', None), (0, b'SQLite format 3\x00', 'SQLite database', '.sqlite'), (0, b'{\\rtf', 'RTF', '.rtf'), (0, b'\xef\xbb\xbf', 'UTF-8 text with BOM', '.txt'), (0, b'\xff\xfe', 'UTF-16LE text', '.txt'), (0, b'<?xml', 'XML', '.xml'), (4, b'ftyp', 'MP4/MOV', '.mp4')]
 BACKEND = None
 _dec_blocks = None
+# _gcm_new(key, iv, tag) returns a streaming GCM decryptor with
+# update(chunk) -> plaintext and verify() -> bool. Plaintext from update()
+# is never released by the callers below until verify() has passed.
+_gcm_new = None
 
 
 class LicenseError(Exception):
     pass
 
 
+class _LibGcm(object):
+    """Thin adapter so both crypto libraries look the same to the caller."""
+    __slots__ = ('_ctx', '_fin', '_tag')
+
+    def __init__(self, ctx, fin, tag=None):
+        self._ctx = ctx
+        self._fin = fin
+        self._tag = tag
+
+    def update(self, data):
+        if self._fin == 'cryptography':
+            return self._ctx.update(data)
+        return self._ctx.decrypt(data)
+
+    def verify(self):
+        try:
+            if self._fin == 'cryptography':
+                self._ctx.finalize()
+            else:
+                self._ctx.verify(self._tag)
+            return True
+        except Exception:
+            return False
+
+
 def _init_backend(force_pure=False):
-    global BACKEND, _dec_blocks
+    global BACKEND, _dec_blocks, _gcm_new
     if not force_pure:
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -298,7 +342,11 @@ def _init_backend(force_pure=False):
             def _dec(key, data):
                 c = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
                 return c.update(data) + c.finalize()
-            _dec_blocks, BACKEND = (_dec, 'cryptography')
+
+            def _gcm(key, iv, tag):
+                c = Cipher(algorithms.AES(key), modes.GCM(iv, tag)).decryptor()
+                return _LibGcm(c, 'cryptography')
+            _dec_blocks, _gcm_new, BACKEND = (_dec, _gcm, 'cryptography')
             return
         except Exception:
             pass
@@ -307,7 +355,11 @@ def _init_backend(force_pure=False):
 
             def _dec(key, data):
                 return _AES.new(key, _AES.MODE_ECB).decrypt(data)
-            _dec_blocks, BACKEND = (_dec, 'pycryptodome')
+
+            def _gcm(key, iv, tag):
+                c = _AES.new(key, _AES.MODE_GCM, nonce=iv, mac_len=GCM_TAG_LEN)
+                return _LibGcm(c, 'pycryptodome', tag)
+            _dec_blocks, _gcm_new, BACKEND = (_dec, _gcm, 'pycryptodome')
             return
         except Exception:
             pass
@@ -315,7 +367,7 @@ def _init_backend(force_pure=False):
     def _dec(key, data):
         ctx = _PureAES(key)
         return b''.join((ctx.decrypt_block(data[i:i + 16]) for i in range(0, len(data), 16)))
-    _dec_blocks, BACKEND = (_dec, 'pure-python')
+    _dec_blocks, _gcm_new, BACKEND = (_dec, _PureGCM, 'pure-python')
 
 def _build_tables():
     sbox = [0] * 256
@@ -410,6 +462,110 @@ class _PureAES(object):
             o[4 * c + 2] = _mul(a[0], 13) ^ _mul(a[1], 9) ^ _mul(a[2], 14) ^ _mul(a[3], 11)
             o[4 * c + 3] = _mul(a[0], 11) ^ _mul(a[1], 13) ^ _mul(a[2], 9) ^ _mul(a[3], 14)
         return o
+
+    # Forward block function. GCM decryption runs AES in counter mode, which
+    # uses the forward direction to make keystream, so the GCM path needs it.
+    # It is only ever called from _PureGCM below. Nothing in this file builds
+    # a tag or writes a .cryptedmicro file.
+    def keystream_block(self, blk):
+        s = self._ark(list(blk), 0)
+        for r in range(1, 14):
+            s = [_SBOX[b] for b in s]
+            s = self._shift(s)
+            s = self._mix(s)
+            s = self._ark(s, r)
+        s = [_SBOX[b] for b in s]
+        s = self._shift(s)
+        return bytes(self._ark(s, 14))
+
+    @staticmethod
+    def _shift(s):
+        o = list(s)
+        for r in range(1, 4):
+            row = [s[r + 4 * c] for c in range(4)]
+            row = row[r:] + row[:r]
+            for c in range(4):
+                o[r + 4 * c] = row[c]
+        return o
+
+    @staticmethod
+    def _mix(s):
+        o = [0] * 16
+        for c in range(4):
+            a = s[4 * c:4 * c + 4]
+            o[4 * c + 0] = _mul(a[0], 2) ^ _mul(a[1], 3) ^ a[2] ^ a[3]
+            o[4 * c + 1] = a[0] ^ _mul(a[1], 2) ^ _mul(a[2], 3) ^ a[3]
+            o[4 * c + 2] = a[0] ^ a[1] ^ _mul(a[2], 2) ^ _mul(a[3], 3)
+            o[4 * c + 3] = _mul(a[0], 3) ^ a[1] ^ a[2] ^ _mul(a[3], 2)
+        return o
+
+
+_GF_R = 0xE1 << 120
+
+
+def _ghash_tables(h):
+    """Per-byte lookup tables for multiplication by H in GF(2^128), GCM bit
+    order. basis[i] is H times the bit i places from the left."""
+    basis = []
+    v = h
+    for _ in range(128):
+        basis.append(v)
+        v = (v >> 1) ^ _GF_R if v & 1 else v >> 1
+    tables = []
+    for p in range(16):
+        t = [0] * 256
+        for b in range(1, 256):
+            low = b & -b
+            t[b] = t[b ^ low] ^ basis[8 * p + 8 - low.bit_length()]
+        tables.append(t)
+    return tables
+
+
+class _PureGCM(object):
+    """AES-256-GCM decrypt-and-verify on the built-in AES, for a bare
+    interpreter. Same interface as _LibGcm. Feed update() chunks whose
+    length is a multiple of 16, except the last one."""
+
+    def __init__(self, key, iv, tag):
+        if len(iv) != GCM_IV_LEN:
+            raise ValueError('this build expects a 12 byte GCM IV')
+        self._aes = _PureAES(key)
+        self._tbl = _ghash_tables(int.from_bytes(self._aes.keystream_block(b'\x00' * 16), 'big'))
+        self._iv = bytes(iv)
+        self._tag = bytes(tag)
+        self._ctr = 2
+        self._y = 0
+        self._clen = 0
+        self._closed = False
+
+    def _gmul(self, y):
+        yb = y.to_bytes(16, 'big')
+        t = self._tbl
+        z = 0
+        for p in range(16):
+            z ^= t[p][yb[p]]
+        return z
+
+    def update(self, data):
+        if self._closed:
+            raise ValueError('only the final chunk may be shorter than a block')
+        if len(data) % 16:
+            self._closed = True
+        out = bytearray()
+        for i in range(0, len(data), 16):
+            blk = data[i:i + 16]
+            self._y = self._gmul(self._y ^ int.from_bytes(blk.ljust(16, b'\x00'), 'big'))
+            ks = self._aes.keystream_block(self._iv + (self._ctr & 0xFFFFFFFF).to_bytes(4, 'big'))
+            self._ctr += 1
+            out.extend((a ^ b for a, b in zip(blk, ks)))
+        self._clen += len(data)
+        return bytes(out)
+
+    def verify(self):
+        s = self._gmul(self._y ^ (self._clen * 8)).to_bytes(16, 'big')
+        ek = self._aes.keystream_block(self._iv + b'\x00\x00\x00\x01')
+        want = bytes((a ^ b for a, b in zip(s, ek)))
+        return _hmac.compare_digest(want, self._tag)
 
 
 def _sealed_integrity_digest():
@@ -590,6 +746,38 @@ def self_test():
     except Exception as exc:
         print('  AES self-test: FAIL (%s)' % exc)
         return 1
+    # GCM path: the KDF against RFC 7914's PBKDF2-HMAC-SHA256 vector, and
+    # AES-256-GCM decrypt against NIST GCM test case 15, on both the active
+    # back end and the built-in one, plus a flipped tag bit that must fail.
+    try:
+        want_dk = bytes.fromhex('55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc'
+                                '49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783')
+        if hashlib.pbkdf2_hmac('sha256', b'passwd', b'salt', 1, 64) != want_dk:
+            print('  PBKDF2-SHA256 vector: FAIL')
+            return 1
+        print('  PBKDF2-SHA256 vector: OK')
+        k = bytes.fromhex('feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308')
+        iv = bytes.fromhex('cafebabefacedbaddecaf888')
+        p = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
+                          '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255')
+        c = bytes.fromhex('522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa'
+                          '8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad')
+        t = bytes.fromhex('b094dac5d93471bdec1a502270e3cc6c')
+        for label, factory in (('back end', _gcm_new), ('pure-python', _PureGCM)):
+            g = factory(k, iv, t)
+            if g.update(c) != p or not g.verify():
+                print('  AES-GCM vector (%s): FAIL' % label)
+                return 1
+            bad = bytes([t[0] ^ 1]) + t[1:]
+            g = factory(k, iv, bad)
+            g.update(c)
+            if g.verify():
+                print('  AES-GCM tag check (%s): FAIL (accepted a corrupted tag)' % label)
+                return 1
+        print('  AES-GCM vector: OK  (back end and pure-python, corrupted tag rejected)')
+    except Exception as exc:
+        print('  AES-GCM self-test: FAIL (%s)' % exc)
+        return 1
     # Report what's bundled for extension repair. CI greps for the
     # "Type detection: filetype " line to confirm the detector was
     # built into the binary. Without a license there is no way to
@@ -714,7 +902,118 @@ def validate_plaintext(pt):
             return (False, label)
     return (strong, label)
 
-def decrypt_file(path, key_string, verify=True):
+def file_size(path):
+    try:
+        return os.path.getsize(long_path(path))
+    except OSError:
+        return None
+
+def ecb_shaped(size):
+    return size is not None and size > 0 and size % 16 == 0
+
+def gcm_shaped(size):
+    return size is not None and size >= GCM_MIN_LEN
+
+_KDF_CACHE = collections.OrderedDict()
+
+def _gcm_password(key_string):
+    # Java's PBKDF2WithHmacSHA256 feeds the char[] in as UTF-8.
+    return key_string.encode('utf-8', 'replace')
+
+def gcm_kdf(key_string, salt):
+    return hashlib.pbkdf2_hmac('sha256', _gcm_password(key_string), bytes(salt), GCM_KDF_ITERS, 32)
+
+def _kdf_remember(key_string, salt, dk):
+    _KDF_CACHE[(key_string, bytes(salt))] = dk
+    if len(_KDF_CACHE) > GCM_KDF_CACHE_CAP:
+        _KDF_CACHE.popitem(last=False)
+
+def gcm_derive_key(key_string, salt):
+    """PBKDF2 is the expensive part of every GCM file, so a derived key is
+    kept once proved and reused by the later write pass."""
+    dk = _KDF_CACHE.get((key_string, bytes(salt)))
+    if dk is None:
+        dk = gcm_kdf(key_string, salt)
+        _kdf_remember(key_string, salt, dk)
+    return dk
+
+def _read_exact(fh, n):
+    buf = bytearray()
+    while len(buf) < n:
+        part = fh.read(n - len(buf))
+        if not part:
+            break
+        buf.extend(part)
+    return bytes(buf)
+
+def gcm_header(path):
+    """(size, salt, iv, tag) for a GCM-shaped file. Raises OSError or
+    ValueError."""
+    with open(long_path(path), 'rb') as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        if size < GCM_MIN_LEN:
+            raise ValueError('too short to be an AES-GCM file (%d bytes)' % size)
+        fh.seek(0)
+        salt = _read_exact(fh, GCM_SALT_LEN)
+        iv = _read_exact(fh, GCM_IV_LEN)
+        fh.seek(size - GCM_TAG_LEN)
+        tag = _read_exact(fh, GCM_TAG_LEN)
+    return (size, salt, iv, tag)
+
+def gcm_stream(path, size, iv, tag, dk, keep=True):
+    """Run GCM over the file body under derived key dk. Returns
+    (plaintext or b'' when keep is False, None) once the tag verifies, or
+    (None, reason). No plaintext leaves here unless the tag matched."""
+    if _gcm_new is None:
+        _init_backend()
+    ctx = _gcm_new(dk, iv, tag)
+    out = [] if keep else None
+    remaining = size - GCM_OVERHEAD
+    try:
+        with open(long_path(path), 'rb') as fh:
+            fh.seek(GCM_SALT_LEN + GCM_IV_LEN)
+            while remaining > 0:
+                chunk = _read_exact(fh, min(GCM_READ_CHUNK, remaining))
+                if not chunk:
+                    return (None, 'file shrank while reading')
+                remaining -= len(chunk)
+                pt = ctx.update(chunk)
+                if keep:
+                    out.append(pt)
+    except OSError as e:
+        return (None, 'cannot read: %s' % e)
+    if not ctx.verify():
+        return (None, 'AES-GCM tag mismatch, wrong key for this file')
+    return (b''.join(out) if keep else b'', None)
+
+def gcm_open_file(path, key_string, keep=True):
+    try:
+        size, salt, iv, tag = gcm_header(path)
+    except (OSError, ValueError) as e:
+        return (None, str(e))
+    return gcm_stream(path, size, iv, tag, gcm_derive_key(key_string, salt), keep=keep)
+
+def _decrypt_gcm(path, key_string):
+    pt, err = gcm_open_file(path, key_string, keep=True)
+    if pt is None:
+        return (None, False, err)
+    # A matching 128-bit tag authenticates every byte, which is a stronger
+    # check than any structural validator, so it counts as verified.
+    return (pt, True, None)
+
+def decrypt_file(path, key_string, verify=True, scheme='ecb'):
+    """scheme: 'ecb' (original !micro), 'gcm' (newer !micro), or 'auto'
+    (GCM first when the file is long enough, then ECB if the length allows
+    it). Returns (plaintext, verified, error)."""
+    if scheme == 'gcm':
+        return _decrypt_gcm(path, key_string)
+    if scheme == 'auto':
+        size = file_size(path)
+        if gcm_shaped(size):
+            res = _decrypt_gcm(path, key_string)
+            if res[0] is not None or not ecb_shaped(size):
+                return res
     try:
         with open(long_path(path), 'rb') as fh:
             ct = fh.read()
@@ -1508,6 +1807,201 @@ def find_all_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8,
         remaining = [f for f in remaining if f not in covered]
     return (mapping, tried_total, remaining)
 
+# ----------------------------------------------------------------------
+# AES-256-GCM key search (newer !micro builds)
+# ----------------------------------------------------------------------
+#
+# There is no shared first block to group on and no cheap header test: each
+# file has its own salt, and every guess costs a 600,000-round PBKDF2 before
+# a single AES block can be tried. In exchange there are no false positives,
+# because the 128-bit tag either matches or it does not. So the search tries
+# a guess against the smallest couple of files, accepts it only on a tag
+# match, and then maps the found key across the rest.
+_GCM_WORKER_PROBES = []
+
+def gcm_probe_set(files, max_probes=2):
+    sized = sorted(((file_size(p), p) for p in files), key=lambda t: (t[0] is None, t[0] or 0))
+    out = []
+    for size, p in sized:
+        if not gcm_shaped(size):
+            continue
+        try:
+            with open(long_path(p), 'rb') as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if len(data) < GCM_MIN_LEN:
+            continue
+        out.append((p, data[:GCM_SALT_LEN], data[GCM_SALT_LEN:GCM_SALT_LEN + GCM_IV_LEN], data[GCM_SALT_LEN + GCM_IV_LEN:-GCM_TAG_LEN], data[-GCM_TAG_LEN:]))
+        if len(out) >= max_probes:
+            break
+    return out
+
+def _gcm_worker_init(probes):
+    global _GCM_WORKER_PROBES
+    _GCM_WORKER_PROBES = probes
+    if BACKEND is None:
+        _init_backend(False)
+
+def _gcm_worker_chunk(chunk):
+    hits = []
+    for cand in chunk:
+        for path, salt, iv, body, tag in _GCM_WORKER_PROBES:
+            dk = gcm_kdf(cand, salt)
+            ctx = _gcm_new(dk, iv, tag)
+            ctx.update(body)
+            if ctx.verify():
+                hits.append((cand, path, salt, dk))
+                break
+    return hits
+
+def _gcm_map_worker(job):
+    path, keys = job
+    try:
+        size, salt, iv, tag = gcm_header(path)
+    except (OSError, ValueError):
+        return (path, None, None, None)
+    for k in keys:
+        dk = gcm_kdf(k, salt)
+        pt, _ = gcm_stream(path, size, iv, tag, dk, keep=False)
+        if pt is not None:
+            return (path, k, salt, dk)
+    return (path, None, None, None)
+
+def _make_pool(workers, initializer=None, initargs=()):
+    if workers <= 1:
+        return None
+    try:
+        import multiprocessing
+        return multiprocessing.Pool(workers, initializer=initializer, initargs=initargs)
+    except Exception:
+        return None
+
+def sweep_gcm(files, plan, workers=1, limit=None, quiet=False):
+    probes = gcm_probe_set(files)
+    if not probes:
+        return ([], 0)
+    tiers = [(n, f) for n, f in plan if n in GCM_TIERS]
+    _gcm_worker_init(probes)
+    pool = _make_pool(workers, _gcm_worker_init, (probes,))
+    seen = BoundedSeen()
+    tried = 0
+    t0 = time.time()
+    chunk_size = max(1, workers) * 4
+    try:
+        for name, factory in tiers:
+            gen = factory()
+            tier_start = tried
+            found = []
+            while True:
+                chunk = []
+                for cand in gen:
+                    if not cand or cand in seen:
+                        continue
+                    seen.add(cand)
+                    chunk.append(cand)
+                    if len(chunk) >= chunk_size:
+                        break
+                if limit:
+                    chunk = chunk[:max(0, limit - tried)]
+                if not chunk:
+                    break
+                if pool:
+                    hits = []
+                    for part in pool.map(_gcm_worker_chunk, [chunk[i::workers] for i in range(workers)]):
+                        hits.extend(part)
+                else:
+                    hits = _gcm_worker_chunk(chunk)
+                tried += len(chunk)
+                for cand, _path, salt, dk in hits:
+                    _kdf_remember(cand, salt, dk)
+                    if cand not in found:
+                        found.append(cand)
+                if not quiet:
+                    rate = tried / max(time.time() - t0, 0.001)
+                    sys.stderr.write('  GCM %-22s %11d tried  %9.1f/s\r' % (name[:22], tried, rate))
+                    sys.stderr.flush()
+                if found or (limit and tried >= limit):
+                    break
+            if not quiet:
+                sys.stderr.write(' ' * 72 + '\r')
+                sys.stderr.flush()
+                print('  GCM tier %-26s %13d candidates  %s' % (name, tried - tier_start, 'HIT' if found else 'no hit'))
+            if found:
+                return (found, tried)
+            if limit and tried >= limit:
+                return ([], tried)
+    finally:
+        if pool:
+            pool.terminate()
+            pool.join()
+    return ([], tried)
+
+def map_gcm_keys_to_files(files, keys, workers=1, quiet=False):
+    """Try each found key on each GCM-shaped file, verifying the full tag.
+    One PBKDF2 per key per file, so this runs across the worker pool, and
+    the derived keys come back to be reused when the files are written."""
+    jobs = [(p, list(keys)) for p in files if gcm_shaped(file_size(p))]
+    mapping = {}
+    if not jobs:
+        return mapping
+    pool = _make_pool(min(workers, len(jobs)))
+    done = 0
+    t0 = time.time()
+    try:
+        results = pool.imap_unordered(_gcm_map_worker, jobs) if pool else map(_gcm_map_worker, jobs)
+        for path, k, salt, dk in results:
+            done += 1
+            if k is not None:
+                _kdf_remember(k, salt, dk)
+                mapping.setdefault(k, []).append(path)
+            if not quiet and (done % 8 == 0 or done == len(jobs)):
+                sys.stderr.write('  checking GCM files: %d/%d  %.0fs\r' % (done, len(jobs), time.time() - t0))
+                sys.stderr.flush()
+    finally:
+        if pool:
+            pool.terminate()
+            pool.join()
+        if not quiet:
+            sys.stderr.write(' ' * 72 + '\r')
+            sys.stderr.flush()
+    order = {p: i for i, p in enumerate(files)}
+    for k in mapping:
+        mapping[k].sort(key=lambda p: order.get(p, 0))
+    return mapping
+
+def find_all_gcm_keys(files, plan, workers=1, limit=None, quiet=False, max_passes=8):
+    mapping = {}
+    remaining = [f for f in files if gcm_shaped(file_size(f))]
+    tried_total = 0
+    passes = 0
+    while remaining and passes < max_passes:
+        passes += 1
+        budget = None
+        if limit is not None:
+            budget = limit - tried_total
+            if budget <= 0:
+                break
+        if mapping and (not quiet):
+            print('  %d GCM file(s) not covered yet, sweeping those on their own:' % len(remaining))
+        found, tried = sweep_gcm(remaining, plan, workers=workers, limit=budget, quiet=quiet)
+        tried_total += tried
+        fresh = [k for k in found if k not in mapping]
+        if not fresh:
+            break
+        part = map_gcm_keys_to_files(remaining, fresh, workers=workers, quiet=quiet)
+        covered = set()
+        for k, hits in part.items():
+            mapping.setdefault(k, [])
+            for path in hits:
+                if path not in mapping[k]:
+                    mapping[k].append(path)
+            covered.update(hits)
+        if not covered:
+            break
+        remaining = [f for f in remaining if f not in covered]
+    return (mapping, tried_total, remaining)
+
 def _gpu_kernel_source():
     sbox = ','.join((str(b) for b in _SBOX))
     isbox = ','.join((str(b) for b in _INV_SBOX))
@@ -1913,6 +2407,8 @@ def main(argv=None):
     if args.wordlist:
         with open(long_path(args.wordlist), 'r', encoding='utf-8', errors='replace') as fh:
             wordlist = [ln.rstrip('\r\n') for ln in fh if ln.strip()]
+    sizes = {f: file_size(f) for f in files}
+    file_scheme = {}
     forced = False
     if args.force and len(args.key) == 1 and (not args.brute) and (not args.dumb_brute) and (not wordlist) and (not args.scavenge):
         mapping = {args.key[0]: files}
@@ -1985,13 +2481,76 @@ def main(argv=None):
                 routes.append('%d workers' % workers)
             tail = ' (%s)' % ', '.join(routes) if routes else ''
             print('Trying keys%s:' % tail)
-        mapping, tried, unmatched = find_all_keys(files, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=max(1, args.max_passes), checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key)
+        mapping = {}
+        tried = 0
+
+        def merge(part, scheme):
+            for k, hits in part.items():
+                lst = mapping.setdefault(k, [])
+                for p in hits:
+                    if p not in lst:
+                        lst.append(p)
+                    if scheme == 'gcm':
+                        file_scheme[p] = 'gcm'
+
+        def budget_left():
+            return None if args.max_candidates is None else args.max_candidates - tried
+        passes = max(1, args.max_passes)
+        # A GCM file is salt+iv+data+tag, so its length is only a multiple of
+        # 16 one time in sixteen; anything else cannot be the original ECB
+        # format. Block-aligned files can be either, and are settled below.
+        gcm_only = [f for f in files if gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f]))]
+        ecb_cand = [f for f in files if ecb_shaped(sizes[f])]
+        if gcm_only:
+            if not args.quiet:
+                print('%d file(s) are in the newer AES-256-GCM format (per-file salt and IV,' % len(gcm_only))
+                print('PBKDF2-SHA256 with 600,000 rounds). Every guess costs a full key')
+                print('stretch on these, so they get the supplied, recovered and variant keys;')
+                print('the fitted model and structural brute are left to the older files.')
+                if gpu is not None:
+                    print('The GPU is not used for the GCM files.')
+                print()
+            gmap, gtried, _ = find_all_gcm_keys(gcm_only, plan, workers=workers, limit=args.max_candidates, quiet=args.quiet, max_passes=passes)
+            tried += gtried
+            merge(gmap, 'gcm')
+            aligned = [f for f in ecb_cand if gcm_shaped(sizes[f])]
+            if gmap and aligned:
+                if not args.quiet:
+                    print('  trying the GCM key(s) on %d block-aligned file(s) as well' % len(aligned))
+                part = map_gcm_keys_to_files(aligned, list(gmap), workers=workers, quiet=args.quiet)
+                merge(part, 'gcm')
+                ecb_cand = [f for f in ecb_cand if f not in file_scheme]
+            if ecb_cand and (not args.quiet):
+                print()
+                print('Original AES-ECB format, %d candidate file(s):' % len(ecb_cand))
+        if ecb_cand and (budget_left() is None or budget_left() > 0):
+            emap, etried, eun = find_all_keys(ecb_cand, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes, checkpoint=args.checkpoint, on_tier_start=gate, gpu=gpu, license_key=license_key)
+            tried += etried
+            merge(emap, 'ecb')
+            leftover = [f for f in eun if gcm_shaped(sizes[f]) and f not in file_scheme]
+            if leftover and (budget_left() is None or budget_left() > 0):
+                if not args.quiet:
+                    print()
+                    print('%d block-aligned file(s) did not open as AES-ECB; checking them as AES-GCM:' % len(leftover))
+                gmap, gtried, _ = find_all_gcm_keys(leftover, plan, workers=workers, limit=budget_left(), quiet=args.quiet, max_passes=passes)
+                tried += gtried
+                merge(gmap, 'gcm')
+        covered_all = set()
+        for hits in mapping.values():
+            covered_all.update(hits)
+        unmatched = [f for f in files if f not in covered_all]
         if not mapping:
             print()
             print('No key opened any file after %d candidate(s).' % tried)
             print()
+            any_ecb = any((ecb_shaped(sizes[f]) for f in files))
             if not args.brute:
                 print('Next step: re-run with --brute to sweep modelled candidates.')
+            elif not any_ecb:
+                print('Next step: these are all AES-GCM files, where open-ended guessing')
+                print('           is not practical. Best odds: --scavenge FILE on a memory')
+                print('           image, pagefile or hibernation file, or --key / --wordlist')
+                print('           with anything the operators were seen typing.')
             elif not args.dumb_brute:
                 print('Next step: add --dumb-brute for a plain structural brute, and')
                 print('           --checkpoint FILE so a long run can resume.')
@@ -2005,6 +2564,10 @@ def main(argv=None):
             print('  * The key is a string the operator typed. It is not derived from')
             print('    anything in the file and cannot be read out of the ciphertext.')
             print('    AES-256 itself is not broken here and is not being attacked.')
+            if any((gcm_shaped(sizes[f]) and (not ecb_shaped(sizes[f])) for f in files)):
+                print('  * The newer AES-GCM files stretch that typed key through 600,000')
+                print('    PBKDF2 rounds per file, so each guess is slow by design. The')
+                print('    recovered keys (and their variants under --brute) were tried.')
             print("  * Do not assume the machine's own recovery paths survived. This")
             print('    crew disables Windows Recovery, Task Manager and Regedit, and')
             print('    adds a Defender exclusion. Check what is actually left rather')
@@ -2051,7 +2614,7 @@ def main(argv=None):
     if not forced:
         for key_string, hits in mapping.items():
             for path in hits[:6]:
-                _, ver, _ = decrypt_file(path, key_string, verify=True)
+                _, ver, _ = decrypt_file(path, key_string, verify=True, scheme=file_scheme.get(path, 'ecb'))
                 if ver:
                     proven.add(key_string)
                     break
@@ -2060,7 +2623,8 @@ def main(argv=None):
             if path in handled:
                 continue
             handled.add(path)
-            pt, verified, err = decrypt_file(path, key_string, verify=not forced)
+            scheme = 'auto' if forced else file_scheme.get(path, 'ecb')
+            pt, verified, err = decrypt_file(path, key_string, verify=not forced, scheme=scheme)
             if pt is None:
                 print('  FAIL   %s  (%s)' % (os.path.basename(path), err))
                 failed += 1
@@ -2098,7 +2662,7 @@ def main(argv=None):
             if verified:
                 recovered += 1
                 if not args.quiet:
-                    print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], len(pt), label or 'unknown type'))
+                    print('  OK     %-56s %10d bytes  %s' % (os.path.basename(dest)[:56], len(pt), (label or 'unknown type') + ('  [GCM, tag verified]' if scheme == 'gcm' else '')))
             elif forced:
                 unverified += 1
                 if not args.quiet:
@@ -2144,6 +2708,9 @@ def main(argv=None):
     print('structure checked out: CRCs, terminators and length fields, not just')
     print('the first few bytes. Open a few anyway, and keep your encrypted')
     print('copies until you are satisfied.')
+    if any((s == 'gcm' for s in file_scheme.values())):
+        print('For the newer AES-GCM files, verified means the 128-bit')
+        print('authentication tag matched, which proves the key and every byte.')
     print()
     print('Rho-9 Systems. Your first line of unusual defense.')
     return 0 if recovered or unverified else 3
