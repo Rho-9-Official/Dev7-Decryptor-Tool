@@ -2,6 +2,13 @@
 
 All notable changes to unmicro, the Dev7 / Micro (`.cryptedmicro`) decryptor.
 
+## 3.8.1
+
+First published build of the 3.8 changes. The `v3.8` tag was created from an
+earlier, partial merge (before the cross-format key fix and the updated
+recovered-key table), so the full 3.8 set ships under this version instead.
+No code changes from 3.8 as merged; same license.
+
 ## 3.8
 
 Recovers the newer AES-GCM `.cryptedmicro` format alongside the original
