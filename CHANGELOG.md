@@ -32,6 +32,9 @@ AES-ECB one.
   pure-Python one, and confirms a corrupted tag is rejected. Still no license
   needed.
 
+- **Sealed recovered-key table updated** with newly recovered operator keys.
+  Same license as 3.7; the table is still only readable with it.
+
 ### Unchanged
 - The original AES-ECB path: decryption, key search, GPU brute, checkpoints
   and verification behave exactly as in 3.7. ECB-only machines see no
